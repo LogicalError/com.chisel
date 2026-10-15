@@ -109,16 +109,13 @@ namespace Chisel.Core
                 CollapseShortEdges(brushes, work, workIndex, ref collapsed, moves);
 
                 // The copies of the brushes it changed
+                var copied = new NativeArray<bool>(brushes.Length, Allocator.Temp);
                 for (int k = 0; k < work.Length; k++)
                 {
                     var brush = work[k].brush;
-                    var first = true;
-                    for (int j = 0; j < k; j++)
-                    {
-                        if (work[j].brush == brush) { first = false; break; }
-                    }
-                    if (!first)
+                    if (copied[brush])
                         continue;
+                    copied[brush] = true;
                     var copy = Copy(brushes[brush].brushRenderBuffer, brush, work, workIndex);
                     patched.Add(copy);
                     var data = brushes[brush];
@@ -459,6 +456,9 @@ namespace Chisel.Core
                     var surfaceCount = brushes[b].brushRenderBuffer.Value.surfaces.Length;
                     for (int s = 0; s < surfaceCount; s++)
                     {
+                        // a decal's pieces follow the corners that move, but their short edges do not move anything
+                        if (brushes[b].brushRenderBuffer.Value.surfaces[s].decalEntityID != 0)
+                            continue;
                         var count = TriangleCount(brushes, work, workIndex, b, s);
                         for (int t = 0; t < count; t++)
                         {
@@ -499,6 +499,29 @@ namespace Chisel.Core
                 var to = new NativeArray<float3>(points.Length, Allocator.Temp);
                 Cluster(points.AsArray(), edges, to);
 
+                // a triangle the collapse leaves without area is dropped, judged from the corners as they were: one the collapse
+                // did not touch stays as it is
+                for (int b = 0; b < brushes.Length; b++)
+                {
+                    if (!brushes[b].brushRenderBuffer.IsCreated)
+                        continue;
+                    var surfaceCount = brushes[b].brushRenderBuffer.Value.surfaces.Length;
+                    for (int s = 0; s < surfaceCount; s++)
+                    {
+                        var count = TriangleCount(brushes, work, workIndex, b, s);
+                        for (int t = 0; t < count; t++)
+                        {
+                            if (!Corners(brushes, work, workIndex, b, s, t, out var c0, out var c1, out var c2))
+                                continue;
+                            var q0 = Position(brushes, work, workIndex, b, s, c0);
+                            var q1 = Position(brushes, work, workIndex, b, s, c1);
+                            var q2 = Position(brushes, work, workIndex, b, s, c2);
+                            var m0 = Moved(q0, out var p0); var m1 = Moved(q1, out var p1); var m2 = Moved(q2, out var p2);
+                            if ((m0 || m1 || m2) && (p0.Equals(p1) || p1.Equals(p2) || p2.Equals(p0) || math.lengthsq(math.cross(p1 - p0, p2 - p0)) == 0))
+                                Drop(brushes, work, workIndex, b, s, t);
+                        }
+                    }
+                }
                 // every corner at a position that moves takes its cluster's
                 for (int b = 0; b < brushes.Length; b++)
                 {
@@ -516,14 +539,7 @@ namespace Chisel.Core
                             var q1 = Position(brushes, work, workIndex, b, s, c1);
                             var q2 = Position(brushes, work, workIndex, b, s, c2);
                             // a corner moved before (by a triangle it shares) is already where its cluster is
-                            if (!ids.ContainsKey(q0 + 0.0f) && !ids.ContainsKey(q1 + 0.0f) && !ids.ContainsKey(q2 + 0.0f))
-                                continue;
                             var m0 = Moved(q0, out var p0); var m1 = Moved(q1, out var p1); var m2 = Moved(q2, out var p2);
-                            if (p0.Equals(p1) || p1.Equals(p2) || p2.Equals(p0) || math.lengthsq(math.cross(p1 - p0, p2 - p0)) == 0)
-                            {
-                                Drop(brushes, work, workIndex, b, s, t);
-                                continue;
-                            }
                             if (!m0 && !m1 && !m2)
                                 continue;
                             var w = WorkOn(brushes, work, workIndex, b, s);

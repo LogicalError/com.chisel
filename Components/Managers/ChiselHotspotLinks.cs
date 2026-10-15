@@ -243,9 +243,24 @@ namespace Chisel.Components
             return true;
         }
 
+        // The links each model's surfaces were last mapped with
+        static readonly Dictionary<ChiselModelComponent, List<ChiselHotspotLink>> s_Mapped = new();
+        static readonly List<ChiselModelComponent> s_Destroyed = new();
+
         // Every model's links to its tree, with its brushes as they are now
         public static void Update()
         {
+            if (s_Mapped.Count > 0)
+            {
+                s_Destroyed.Clear();
+                foreach (var key in s_Mapped.Keys)
+                {
+                    if (!key)
+                        s_Destroyed.Add(key);
+                }
+                foreach (var key in s_Destroyed)
+                    s_Mapped.Remove(key);
+            }
             foreach (var model in ChiselModelManager.Instance.Models)
             {
                 if (!model || !model.Node.Valid)
@@ -274,12 +289,21 @@ namespace Chisel.Components
                 }
                 if (ChiselHotspotLinkStore.SetLinks(model.Node, links.AsArray()))
                 {
-                    // the surfaces of every link are mapped again
+                    // the surfaces of every link are mapped again, those of a link that is gone too (an undo removes links)
                     foreach (var link in stored)
                     {
                         if (link.a) link.a.SetDirty();
                         if (link.b) link.b.SetDirty();
                     }
+                    if (s_Mapped.TryGetValue(model, out var previous))
+                    {
+                        foreach (var link in previous)
+                        {
+                            if (link.a) link.a.SetDirty();
+                            if (link.b) link.b.SetDirty();
+                        }
+                    }
+                    s_Mapped[model] = new List<ChiselHotspotLink>(stored);
                 }
             }
         }

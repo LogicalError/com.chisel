@@ -7,6 +7,14 @@ namespace Chisel.Core
 {
     // After the model's weld: the surfaces with hotspot sections are cut where their sections meet and given their uvs.
     // Only what is drawn is cut; the collider keeps the welded triangles (ChiselSurfaceRenderBuffer.physicsIndices).
+    // A brush's cut surfaces, with what they were made from
+    internal struct HotspotCutEntry
+    {
+        public uint4 key;
+        public BlobAssetReference<ChiselBrushRenderBuffer> result;
+        public bool used;
+    }
+
     internal static class OutputHotspotSections
     {
         // kept: each brush's own buffer, as the tree keeps it (before the weld patched any); it is told the group each of its
@@ -14,7 +22,7 @@ namespace Chisel.Core
         public static void CutModel(NativeList<BrushData> brushes, NativeList<BlobAssetReference<ChiselBrushRenderBuffer>> patched,
                                     NativeArray<HotspotTileData> tiles, NativeArray<HotspotLayoutData> layouts, NativeArray<HotspotLink> links,
                                     NativeArray<float4> tileSides = default, NativeArray<BlobAssetReference<ChiselBrushRenderBuffer>> kept = default,
-                                    NativeArray<ulong> variants = default)
+                                    NativeArray<ulong> variants = default, NativeParallelHashMap<CompactNodeID, HotspotCutEntry> cache = default)
         {
             // coplanar neighbours, of any brush, mapped as one surface (HotspotGroups)
             var groupOf    = new UnsafeHashMap<int2, int>(64, Allocator.Temp);
@@ -39,18 +47,156 @@ namespace Chisel.Core
                     surfaces[s].hotspot.groupVariations = grouped ? groups[g].info.variations : 0;
                 }
             }
+            var cached = cache.IsCreated;
+            var groupKeys = new NativeArray<uint4>(cached ? groups.Length : 0, Allocator.Temp);
+            var globalKey = default(uint4);
+            if (cached)
+            {
+                for (int g = 0; g < groups.Length; g++)
+                    groupKeys[g] = HashGroup(groups[g], lines, halfPlanes, cells);
+                globalKey = HashInputs(layouts, tileSides, variants);
+            }
+            using var rules = new NativeList<HotspotBorderCorner>(4, Allocator.Temp);
             for (int b = 0; b < brushes.Length; b++)
             {
+                var nodeID = brushes[b].brushIndexOrder.compactNodeID;
                 if (!brushes[b].brushRenderBuffer.IsCreated ||
                     (!HasSections(ref brushes[b].brushRenderBuffer.Value) && !InGroup(ref brushes[b].brushRenderBuffer.Value, b, groupOf)))
+                {
+                    if (cached && cache.TryGetValue(nodeID, out var stale))
+                    {
+                        if (stale.result.IsCreated)
+                            stale.result.Dispose();
+                        cache.Remove(nodeID);
+                    }
                     continue;
-                var copy = Cut(brushes[b].brushRenderBuffer, b, groupOf, unfoldOf, bordersOf, groups, lines, halfPlanes, cells, tileSides, layouts, variants);
-                patched.Add(copy);
+                }
+                // what the cut reads: the brush as the weld left it, its groups, the borders given by hand, the layouts
+                var key = default(uint4);
+                var keyed = false;
+                if (cached)
+                    keyed = BrushKey(brushes[b].brushRenderBuffer, b, groupOf, unfoldOf, bordersOf, groupKeys, globalKey, rules, out key);
+                BlobAssetReference<ChiselBrushRenderBuffer> copy;
+                if (keyed && cache.TryGetValue(nodeID, out var entry) && entry.result.IsCreated && entry.key.Equals(key))
+                {
+                    copy = entry.result;
+                    entry.used = true;
+                    cache[nodeID] = entry;
+                }
+                else
+                {
+                    copy = Cut(brushes[b].brushRenderBuffer, b, groupOf, unfoldOf, bordersOf, groups, lines, halfPlanes, cells, tileSides, layouts, variants);
+                    if (keyed)
+                    {
+                        if (cache.TryGetValue(nodeID, out var old) && old.result.IsCreated)
+                            old.result.Dispose();
+                        cache[nodeID] = new HotspotCutEntry { key = key, result = copy, used = true };
+                    }
+                    else
+                        patched.Add(copy);
+                }
                 var data = brushes[b];
                 data.brushRenderBuffer = copy;
                 brushes[b] = data;
             }
+            if (cached)
+            {
+                // the brushes this update did not cut are gone, or are not cut any more
+                using var gone = new NativeList<CompactNodeID>(Allocator.Temp);
+                foreach (var pair in cache)
+                {
+                    if (!pair.Value.used)
+                        gone.Add(pair.Key);
+                }
+                foreach (var id in gone)
+                {
+                    if (cache.TryGetValue(id, out var dead) && dead.result.IsCreated)
+                        dead.result.Dispose();
+                    cache.Remove(id);
+                }
+                using var left = cache.GetKeyArray(Allocator.Temp);
+                foreach (var id in left)
+                {
+                    var kept2 = cache[id];
+                    kept2.used = false;
+                    cache[id] = kept2;
+                }
+            }
             groupOf.Dispose(); unfoldOf.Dispose(); bordersOf.Dispose(); groups.Dispose(); lines.Dispose(); halfPlanes.Dispose(); cells.Dispose();
+        }
+
+        // The size of a blob's data: it sits in the header in front of it (Unity.Entities BlobAssetHeader, 32 bytes, Length at 8)
+        static unsafe bool BlobBytes(BlobAssetReference<ChiselBrushRenderBuffer> blob, out byte* data, out int length)
+        {
+            data = (byte*)blob.GetUnsafePtr();
+            length = *(int*)(data - 32 + 8);
+            return length > 0 && length < (1 << 30);
+        }
+
+        static unsafe uint4 Hash(void* data, long length) { return length == 0 ? default : xxHash3.Hash128(data, length); }
+
+        // The group as the cut reads it: where its sections start in the model's flat lists changes with the other groups
+        static unsafe uint4 HashGroup(HotspotGroups.Group group, NativeList<HotspotSectionLine> lines, NativeList<HotspotSectionHalfPlane> halfPlanes,
+                                      NativeList<HotspotSectionCell> cells)
+        {
+            var start = group.sectionStart;
+            var count = group.sectionCount;
+            group.sectionStart = int3.zero;
+            var parts = stackalloc uint4[4];
+            parts[0] = Hash(&group, UnsafeUtility.SizeOf<HotspotGroups.Group>());
+            parts[1] = Hash((byte*)lines.GetUnsafePtr()      + (long)start.x * UnsafeUtility.SizeOf<HotspotSectionLine>(),      (long)count.x * UnsafeUtility.SizeOf<HotspotSectionLine>());
+            parts[2] = Hash((byte*)halfPlanes.GetUnsafePtr() + (long)start.y * UnsafeUtility.SizeOf<HotspotSectionHalfPlane>(), (long)count.y * UnsafeUtility.SizeOf<HotspotSectionHalfPlane>());
+            parts[3] = Hash((byte*)cells.GetUnsafePtr()      + (long)start.z * UnsafeUtility.SizeOf<HotspotSectionCell>(),      (long)count.z * UnsafeUtility.SizeOf<HotspotSectionCell>());
+            return Hash(parts, 4 * 16);
+        }
+
+        static unsafe uint4 HashInputs(NativeArray<HotspotLayoutData> layouts, NativeArray<float4> tileSides, NativeArray<ulong> variants)
+        {
+            var parts = stackalloc uint4[3];
+            parts[0] = layouts.IsCreated   ? Hash(layouts.GetUnsafeReadOnlyPtr(),   (long)layouts.Length   * UnsafeUtility.SizeOf<HotspotLayoutData>()) : default;
+            parts[1] = tileSides.IsCreated ? Hash(tileSides.GetUnsafeReadOnlyPtr(), (long)tileSides.Length * UnsafeUtility.SizeOf<float4>()) : default;
+            parts[2] = variants.IsCreated  ? Hash(variants.GetUnsafeReadOnlyPtr(),  (long)variants.Length  * UnsafeUtility.SizeOf<ulong>()) : default;
+            return Hash(parts, 3 * 16);
+        }
+
+        // One key for everything Cut reads for the brush; false when the brush cannot be keyed (it is cut every time then)
+        static unsafe bool BrushKey(BlobAssetReference<ChiselBrushRenderBuffer> source, int brush, UnsafeHashMap<int2, int> groupOf, UnsafeHashMap<int2, float4x4> unfoldOf,
+                                    in UnsafeParallelMultiHashMap<int2, HotspotBorderCorner> bordersOf, NativeArray<uint4> groupKeys, uint4 globalKey,
+                                    NativeList<HotspotBorderCorner> rules, out uint4 key)
+        {
+            key = default;
+            if (!BlobBytes(source, out var data, out var length))
+                return false;
+            var buffer = new UnsafeAppendBuffer(256, 16, Allocator.Temp);
+            try
+            {
+                buffer.Add(Hash(data, length));
+                buffer.Add(globalKey);
+                ref var surfaces = ref source.Value.surfaces;
+                for (int s = 0; s < surfaces.Length; s++)
+                {
+                    if (surfaces[s].indices.Length > 0 && groupOf.TryGetValue(new int2(brush, s), out var g))
+                    {
+                        buffer.Add(1);
+                        buffer.Add(groupKeys[g]);
+                        var unfolded = unfoldOf.TryGetValue(new int2(brush, s), out var unfold);
+                        buffer.Add(unfolded);
+                        if (unfolded)
+                            buffer.Add(unfold);
+                        continue;
+                    }
+                    HotspotGroups.BordersOf(new int2(brush, s), bordersOf, rules);
+                    buffer.Add(2 + rules.Length);
+                    for (int r = 0; r < rules.Length; r++)
+                        buffer.Add(rules[r]);
+                }
+                key = xxHash3.Hash128(buffer.Ptr, buffer.Length);
+                return true;
+            }
+            finally
+            {
+                buffer.Dispose();
+            }
         }
 
         static bool InGroup(ref ChiselBrushRenderBuffer buffer, int brush, UnsafeHashMap<int2, int> groupOf)

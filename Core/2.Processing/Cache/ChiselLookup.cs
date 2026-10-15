@@ -51,6 +51,8 @@ namespace Chisel.Core
             public NativeList<uint>                                             hotspotLayoutHashes;
             // Where the weld's last step moved the corners it moved at the last update (from, to; OutputModelWeld)
             public NativeList<float3x2>                                         collapseMoves;
+            // What the hotspot cut made of each brush's surfaces, kept while its inputs stay the same (OutputHotspotSections.CutModel)
+            public NativeParallelHashMap<CompactNodeID, HotspotCutEntry>        hotspotCutCache;
 
 			internal void Initialize()
             {
@@ -77,6 +79,7 @@ namespace Chisel.Core
 				hotspotLinks                = new NativeList<HotspotLink>(4, Allocator.Persistent);
 				hotspotLayoutHashes         = new NativeList<uint>(4, Allocator.Persistent);
 				collapseMoves               = new NativeList<float3x2>(4, Allocator.Persistent);
+				hotspotCutCache             = new NativeParallelHashMap<CompactNodeID, HotspotCutEntry>(16, Allocator.Persistent);
 				decalTargets                = new NativeList<ChiselDecalTarget>(16, Allocator.Persistent);
 				decalVolumeTargets          = new NativeList<ChiselDecalTarget>(16, Allocator.Persistent);
 				changedDecalBounds          = new NativeList<MinMaxAABB>(16, Allocator.Persistent);
@@ -273,6 +276,16 @@ namespace Chisel.Core
                 hotspotLayoutHashes = default;
                 if (collapseMoves.IsCreated) collapseMoves.Dispose();
                 collapseMoves = default;
+                if (hotspotCutCache.IsCreated)
+                {
+                    foreach (var entry in hotspotCutCache)
+                    {
+                        if (entry.Value.result.IsCreated)
+                            entry.Value.result.Dispose();
+                    }
+                    hotspotCutCache.Dispose();
+                }
+                hotspotCutCache = default;
                 decalInstances = default;
                 decalBounds = default;
                 decalVolumes = default;

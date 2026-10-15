@@ -2442,7 +2442,8 @@ namespace Chisel.Core
 
                         // Read/Write
                         surfaceCountRef = Temporaries.surfaceCountRef,
-                        collapseMoves   = chiselLookupValues.collapseMoves
+                        collapseMoves   = chiselLookupValues.collapseMoves,
+                        hotspotCutCache = chiselLookupValues.hotspotCutCache
                     };
                     findBrushRenderBuffersJob.Schedule(runInParallel,
                         JobHandles.Read(

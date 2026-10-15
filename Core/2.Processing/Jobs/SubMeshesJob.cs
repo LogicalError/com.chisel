@@ -93,6 +93,8 @@ namespace Chisel.Core
         [NoAlias] public NativeReference<int> surfaceCountRef;
         // where the weld's last step moved the corners it moved (OutputModelWeld.WeldModel), kept with the tree
         [NoAlias] public NativeList<float3x2> collapseMoves;
+        // what the hotspot cut made of each brush, kept with the tree
+        [NoAlias] public NativeParallelHashMap<CompactNodeID, HotspotCutEntry> hotspotCutCache;
 
         public void Execute()
         {
@@ -130,7 +132,7 @@ namespace Chisel.Core
             // The weld at the very end across the whole model: needles that close a seam go with the triangle across them
             OutputModelWeld.WeldModel(brushRenderData, patchedRenderBuffers, collapseMoves);
             // Then what is drawn of hotspot surfaces is cut into its sections; the collider stays as welded
-            OutputHotspotSections.CutModel(brushRenderData, patchedRenderBuffers, hotspotTiles, hotspotLayouts, hotspotLinks, hotspotTileSides, kept, hotspotVariants);
+            OutputHotspotSections.CutModel(brushRenderData, patchedRenderBuffers, hotspotTiles, hotspotLayouts, hotspotLinks, hotspotTileSides, kept, hotspotVariants, hotspotCutCache);
         }
     }
 

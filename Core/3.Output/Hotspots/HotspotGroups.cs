@@ -354,6 +354,25 @@ namespace Chisel.Core
 
             // each member unfolded into its group's first plane: from the first outwards, each about the edge it shares with
             // the one it was reached from
+            // the spanning tree's edges at each surface, in the order they were found
+            var adjacencyStart = new NativeArray<int>(candidates.Length + 1, Allocator.Temp);
+            for (int j = 0; j < tree.Length; j++)
+            {
+                adjacencyStart[tree[j].x + 1]++;
+                adjacencyStart[tree[j].y + 1]++;
+            }
+            for (int c = 0; c < candidates.Length; c++)
+                adjacencyStart[c + 1] += adjacencyStart[c];
+            var adjacency = new NativeArray<int>(adjacencyStart[candidates.Length], Allocator.Temp);
+            var adjacencyAt = new NativeArray<int>(candidates.Length, Allocator.Temp);
+            for (int c = 0; c < candidates.Length; c++)
+                adjacencyAt[c] = adjacencyStart[c];
+            for (int j = 0; j < tree.Length; j++)
+            {
+                adjacency[adjacencyAt[tree[j].x]++] = tree[j].y;
+                adjacency[adjacencyAt[tree[j].y]++] = tree[j].x;
+            }
+            adjacencyAt.Dispose();
             var unfold  = new NativeArray<float4x4>(candidates.Length, Allocator.Temp);
             var reached = new NativeArray<bool>(candidates.Length, Allocator.Temp);
             var queue   = new NativeList<int>(16, Allocator.Temp);
@@ -369,10 +388,10 @@ namespace Chisel.Core
                 for (int q = 0; q < queue.Length; q++)
                 {
                     var from = queue[q];
-                    for (int j = 0; j < tree.Length; j++)
+                    for (int k = adjacencyStart[from]; k < adjacencyStart[from + 1]; k++)
                     {
-                        var to = tree[j].x == from ? tree[j].y : (tree[j].y == from ? tree[j].x : -1);
-                        if (to < 0 || reached[to])
+                        var to = adjacency[k];
+                        if (reached[to])
                             continue;
                         reached[to] = true;
                         queue.Add(to);
@@ -382,8 +401,23 @@ namespace Chisel.Core
             }
             reached.Dispose();
             queue.Dispose();
+            adjacency.Dispose();
+            adjacencyStart.Dispose();
             tree.Dispose();
             joined.Dispose();
+            // each group's surfaces, in candidate order
+            var memberStart = new NativeArray<int>(candidates.Length + 1, Allocator.Temp);
+            for (int c = 0; c < candidates.Length; c++)
+                memberStart[Root(c) + 1]++;
+            for (int c = 0; c < candidates.Length; c++)
+                memberStart[c + 1] += memberStart[c];
+            var memberAt = new NativeArray<int>(candidates.Length, Allocator.Temp);
+            var memberOf = new NativeArray<int>(candidates.Length, Allocator.Temp);
+            for (int c = 0; c < candidates.Length; c++)
+                memberAt[c] = memberStart[c];
+            for (int c = 0; c < candidates.Length; c++)
+                memberOf[memberAt[Root(c)]++] = c;
+            memberAt.Dispose();
             var members   = new NativeList<int>(16, Allocator.Temp);
             var positions = new NativeList<float3>(64, Allocator.Temp);
             var indices   = new NativeList<int>(64, Allocator.Temp);
@@ -405,10 +439,9 @@ namespace Chisel.Core
                 if (Root(lead) != lead || size[lead] < 2)
                     continue;
                 members.Clear(); positions.Clear(); indices.Clear(); rules.Clear(); placed.Clear();
-                for (int c = lead; c < candidates.Length; c++)
+                for (int k = memberStart[lead]; k < memberStart[lead + 1]; k++)
                 {
-                    if (Root(c) != lead)
-                        continue;
+                    var c = memberOf[k];
                     members.Add(c);
                     ref var surface = ref brushes[candidates[c].x].brushRenderBuffer.Value.surfaces[candidates[c].y];
                     var first = positions.Length;
@@ -486,6 +519,8 @@ namespace Chisel.Core
                 }
             }
             members.Dispose(); positions.Dispose(); indices.Dispose(); rules.Dispose(); memberRules.Dispose(); placed.Dispose();
+            memberStart.Dispose();
+            memberOf.Dispose();
             size.Dispose();
             unfold.Dispose();
             parent.Dispose();

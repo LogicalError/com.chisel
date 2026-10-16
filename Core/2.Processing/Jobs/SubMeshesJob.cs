@@ -95,6 +95,8 @@ namespace Chisel.Core
         [NoAlias] public NativeList<float3x2> collapseMoves;
         // what the hotspot cut made of each brush, kept with the tree
         [NoAlias] public NativeParallelHashMap<CompactNodeID, HotspotCutEntry> hotspotCutCache;
+        // the model's hotspot groups and the brushes left to cut (CutHotspotBrushesJob)
+        [NoAlias] public HotspotCutState hotspotCut;
 
         public void Execute()
         {
@@ -131,8 +133,49 @@ namespace Chisel.Core
                 kept[i] = brushRenderData[i].brushRenderBuffer;
             // The weld at the very end across the whole model: needles that close a seam go with the triangle across them
             OutputModelWeld.WeldModel(brushRenderData, patchedRenderBuffers, collapseMoves);
-            // Then what is drawn of hotspot surfaces is cut into its sections; the collider stays as welded
-            OutputHotspotSections.CutModel(brushRenderData, patchedRenderBuffers, hotspotTiles, hotspotLayouts, hotspotLinks, hotspotTileSides, kept, hotspotVariants, hotspotCutCache);
+            // Then what is drawn of hotspot surfaces is cut into its sections (CutHotspotBrushesJob); the collider stays as welded
+            OutputHotspotSections.PlanCut(brushRenderData, hotspotTiles, hotspotLayouts, hotspotLinks, hotspotTileSides, kept, hotspotVariants, hotspotCutCache, ref hotspotCut);
+        }
+    }
+
+    // Each brush FindBrushRenderBuffersJob left to cut, cut on its own
+    [BurstCompile(CompileSynchronously = true)]
+    struct CutHotspotBrushesJob : IJobParallelForDefer
+    {
+        [NoAlias, ReadOnly] public NativeArray<BrushData>         brushRenderData;
+        [NoAlias, ReadOnly] public NativeArray<HotspotLayoutData> hotspotLayouts;
+        [NoAlias, ReadOnly] public NativeArray<float4>            hotspotTileSides;
+        [NoAlias, ReadOnly] public NativeArray<ulong>             hotspotVariants;
+        [NoAlias, ReadOnly] public NativeReference<UnsafeHashMap<int2, int>>      groupOf;
+        [NoAlias, ReadOnly] public NativeReference<UnsafeHashMap<int2, float4x4>> unfoldOf;
+        [NoAlias, ReadOnly] public UnsafeParallelMultiHashMap<int2, HotspotBorderCorner> bordersOf;
+        [NoAlias, ReadOnly] public NativeList<HotspotGroups.Group>      groups;
+        [NoAlias, ReadOnly] public NativeList<HotspotSectionLine>      lines;
+        [NoAlias, ReadOnly] public NativeList<HotspotSectionHalfPlane> halfPlanes;
+        [NoAlias, ReadOnly] public NativeList<HotspotSectionCell>      cells;
+
+        [NoAlias] public NativeArray<HotspotCutWork> work;
+
+        public void Execute(int index)
+        {
+            work[index] = OutputHotspotSections.CutPlanned(work[index], brushRenderData, groupOf.Value, unfoldOf.Value, bordersOf, groups, lines, halfPlanes, cells,
+                                                           hotspotTileSides, hotspotLayouts, hotspotVariants);
+        }
+    }
+
+    // The cuts handed to the brushes and the cache
+    [BurstCompile(CompileSynchronously = true)]
+    struct FinishHotspotCutJob : IJob
+    {
+        [NoAlias, ReadOnly] public NativeList<HotspotCutWork> work;
+
+        [NoAlias] public NativeList<BrushData> brushRenderData;
+        [NoAlias] public NativeList<BlobAssetReference<ChiselBrushRenderBuffer>> patchedRenderBuffers;
+        [NoAlias] public NativeParallelHashMap<CompactNodeID, HotspotCutEntry> hotspotCutCache;
+
+        public void Execute()
+        {
+            OutputHotspotSections.FinishCut(brushRenderData, patchedRenderBuffers, work, hotspotCutCache);
         }
     }
 

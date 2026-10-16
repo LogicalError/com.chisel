@@ -15,6 +15,93 @@ namespace Chisel.Core
         public bool used;
     }
 
+    // A brush to cut (OutputHotspotSections.PlanCut), and what the cut made of it
+    internal struct HotspotCutWork
+    {
+        public int brush;
+        public uint4 key;
+        public bool keyed;
+        public BlobAssetReference<ChiselBrushRenderBuffer> result;
+    }
+
+    // What planning the cut finds for the model, read by every brush's cut
+    internal struct HotspotCutState
+    {
+        // the maps behind a reference: an UnsafeHashMap copied into a job keeps its storage from before it grew
+        public NativeReference<UnsafeHashMap<int2, int>> groupOfRef;
+        public NativeReference<UnsafeHashMap<int2, float4x4>> unfoldOfRef;
+        public UnsafeParallelMultiHashMap<int2, HotspotBorderCorner> bordersOf;
+        public NativeList<HotspotGroups.Group> groups;
+        public NativeList<HotspotSectionLine> lines;
+        public NativeList<HotspotSectionHalfPlane> halfPlanes;
+        public NativeList<HotspotSectionCell> cells;
+        public NativeList<HotspotCutWork> work;
+
+        public static HotspotCutState Create(Allocator allocator)
+        {
+            return new HotspotCutState
+            {
+                groupOfRef  = new NativeReference<UnsafeHashMap<int2, int>>(new UnsafeHashMap<int2, int>(64, allocator), allocator),
+                unfoldOfRef = new NativeReference<UnsafeHashMap<int2, float4x4>>(new UnsafeHashMap<int2, float4x4>(8, allocator), allocator),
+                bordersOf  = new UnsafeParallelMultiHashMap<int2, HotspotBorderCorner>(8, allocator),
+                groups     = new NativeList<HotspotGroups.Group>(8, allocator),
+                lines      = new NativeList<HotspotSectionLine>(32, allocator),
+                halfPlanes = new NativeList<HotspotSectionHalfPlane>(64, allocator),
+                cells      = new NativeList<HotspotSectionCell>(32, allocator),
+                work       = new NativeList<HotspotCutWork>(16, allocator)
+            };
+        }
+
+        public readonly unsafe ref UnsafeHashMap<int2, int> GroupOf => ref UnsafeUtility.AsRef<UnsafeHashMap<int2, int>>(groupOfRef.GetUnsafePtr());
+        public readonly unsafe ref UnsafeHashMap<int2, float4x4> UnfoldOf => ref UnsafeUtility.AsRef<UnsafeHashMap<int2, float4x4>>(unfoldOfRef.GetUnsafePtr());
+
+        public void Dispose()
+        {
+            if (groupOfRef.IsCreated)  { if (GroupOf.IsCreated) GroupOf.Dispose(); groupOfRef.Dispose(); }
+            if (unfoldOfRef.IsCreated) { if (UnfoldOf.IsCreated) UnfoldOf.Dispose(); unfoldOfRef.Dispose(); }
+            if (bordersOf.IsCreated)  bordersOf.Dispose();
+            if (groups.IsCreated)     groups.Dispose();
+            if (lines.IsCreated)      lines.Dispose();
+            if (halfPlanes.IsCreated) halfPlanes.Dispose();
+            if (cells.IsCreated)      cells.Dispose();
+            if (work.IsCreated)       work.Dispose();
+        }
+
+        public Unity.Jobs.JobHandle Dispose(Unity.Jobs.JobHandle dependency)
+        {
+            // the maps as the jobs left them, then their references
+            if (groupOfRef.IsCreated && unfoldOfRef.IsCreated)
+                dependency = Unity.Jobs.IJobExtensions.Schedule(new DisposeHotspotCutMapsJob { groupOf = groupOfRef, unfoldOf = unfoldOfRef }, dependency);
+            var handles = new NativeArray<Unity.Jobs.JobHandle>(8, Allocator.Temp);
+            for (int i = 0; i < handles.Length; i++)
+                handles[i] = dependency;
+            if (groupOfRef.IsCreated)  handles[0] = groupOfRef.Dispose(dependency);
+            if (unfoldOfRef.IsCreated) handles[1] = unfoldOfRef.Dispose(dependency);
+            if (bordersOf.IsCreated)  handles[2] = bordersOf.Dispose(dependency);
+            if (groups.IsCreated)     handles[3] = groups.Dispose(dependency);
+            if (lines.IsCreated)      handles[4] = lines.Dispose(dependency);
+            if (halfPlanes.IsCreated) handles[5] = halfPlanes.Dispose(dependency);
+            if (cells.IsCreated)      handles[6] = cells.Dispose(dependency);
+            if (work.IsCreated)       handles[7] = work.Dispose(dependency);
+            var all = Unity.Jobs.JobHandle.CombineDependencies(handles);
+            handles.Dispose();
+            return all;
+        }
+    }
+
+    [Unity.Burst.BurstCompile]
+    struct DisposeHotspotCutMapsJob : Unity.Jobs.IJob
+    {
+        public NativeReference<UnsafeHashMap<int2, int>> groupOf;
+        public NativeReference<UnsafeHashMap<int2, float4x4>> unfoldOf;
+
+        public void Execute()
+        {
+            var a = groupOf.Value;  if (a.IsCreated) a.Dispose();
+            var b = unfoldOf.Value; if (b.IsCreated) b.Dispose();
+        }
+    }
+
     internal static class OutputHotspotSections
     {
         // kept: each brush's own buffer, as the tree keeps it (before the weld patched any); it is told the group each of its
@@ -24,17 +111,34 @@ namespace Chisel.Core
                                     NativeArray<float4> tileSides = default, NativeArray<BlobAssetReference<ChiselBrushRenderBuffer>> kept = default,
                                     NativeArray<ulong> variants = default, NativeParallelHashMap<CompactNodeID, HotspotCutEntry> cache = default)
         {
-            // coplanar neighbours, of any brush, mapped as one surface (HotspotGroups)
-            var groupOf    = new UnsafeHashMap<int2, int>(64, Allocator.Temp);
-            var unfoldOf   = new UnsafeHashMap<int2, float4x4>(8, Allocator.Temp);
-            var groups     = new NativeList<HotspotGroups.Group>(8, Allocator.Temp);
-            var lines      = new NativeList<HotspotSectionLine>(32, Allocator.Temp);
-            var halfPlanes = new NativeList<HotspotSectionHalfPlane>(64, Allocator.Temp);
-            var cells      = new NativeList<HotspotSectionCell>(32, Allocator.Temp);
-            // and the edges given a border or none by hand
-            var bordersOf  = new UnsafeParallelMultiHashMap<int2, HotspotBorderCorner>(8, Allocator.Temp);
-            HotspotGroups.Borders(brushes, links, ref bordersOf);
-            HotspotGroups.Find(brushes, tiles, layouts, links, bordersOf, ref groupOf, ref unfoldOf, groups, lines, halfPlanes, cells, tileSides);
+            var state = HotspotCutState.Create(Allocator.Temp);
+            try
+            {
+                PlanCut(brushes, tiles, layouts, links, tileSides, kept, variants, cache, ref state);
+                var work = state.work.AsArray();
+                for (int i = 0; i < work.Length; i++)
+                    work[i] = CutPlanned(work[i], brushes.AsArray(), state.GroupOf, state.UnfoldOf, state.bordersOf, state.groups, state.lines,
+                                         state.halfPlanes, state.cells, tileSides, layouts, variants);
+                FinishCut(brushes, patched, state.work, cache);
+            }
+            finally
+            {
+                state.Dispose();
+            }
+        }
+
+        // The model's groups (HotspotGroups), and the brushes to cut (work): a brush whose inputs are what they were when
+        // the cache kept its cut is given that cut here
+        public static void PlanCut(NativeList<BrushData> brushes, NativeArray<HotspotTileData> tiles, NativeArray<HotspotLayoutData> layouts,
+                                   NativeArray<HotspotLink> links, NativeArray<float4> tileSides, NativeArray<BlobAssetReference<ChiselBrushRenderBuffer>> kept,
+                                   NativeArray<ulong> variants, NativeParallelHashMap<CompactNodeID, HotspotCutEntry> cache, ref HotspotCutState state)
+        {
+            state.work.Clear();
+            HotspotGroups.Borders(brushes, links, ref state.bordersOf);
+            HotspotGroups.Find(brushes, tiles, layouts, links, state.bordersOf, ref state.GroupOf, ref state.UnfoldOf, state.groups, state.lines,
+                               state.halfPlanes, state.cells, tileSides);
+            var groupOf = state.GroupOf;
+            var groups  = state.groups;
             for (int b = 0; kept.IsCreated && b < kept.Length && b < brushes.Length; b++)
             {
                 if (!kept[b].IsCreated)
@@ -53,7 +157,7 @@ namespace Chisel.Core
             if (cached)
             {
                 for (int g = 0; g < groups.Length; g++)
-                    groupKeys[g] = HashGroup(groups[g], lines, halfPlanes, cells);
+                    groupKeys[g] = HashGroup(groups[g], state.lines, state.halfPlanes, state.cells);
                 globalKey = HashInputs(layouts, tileSides, variants);
             }
             using var rules = new NativeList<HotspotBorderCorner>(4, Allocator.Temp);
@@ -75,54 +179,77 @@ namespace Chisel.Core
                 var key = default(uint4);
                 var keyed = false;
                 if (cached)
-                    keyed = BrushKey(brushes[b].brushRenderBuffer, b, groupOf, unfoldOf, bordersOf, groupKeys, globalKey, rules, out key);
-                BlobAssetReference<ChiselBrushRenderBuffer> copy;
+                    keyed = BrushKey(brushes[b].brushRenderBuffer, b, groupOf, state.UnfoldOf, state.bordersOf, groupKeys, globalKey, rules, out key);
                 if (keyed && cache.TryGetValue(nodeID, out var entry) && entry.result.IsCreated && entry.key.Equals(key))
                 {
-                    copy = entry.result;
                     entry.used = true;
                     cache[nodeID] = entry;
+                    var data = brushes[b];
+                    data.brushRenderBuffer = entry.result;
+                    brushes[b] = data;
+                    continue;
+                }
+                state.work.Add(new HotspotCutWork { brush = b, key = key, keyed = keyed });
+            }
+            groupKeys.Dispose();
+        }
+
+        // One planned brush cut; each is independent of the others, so they can be cut at the same time
+        public static HotspotCutWork CutPlanned(HotspotCutWork work, NativeArray<BrushData> brushes, UnsafeHashMap<int2, int> groupOf,
+                                                UnsafeHashMap<int2, float4x4> unfoldOf, in UnsafeParallelMultiHashMap<int2, HotspotBorderCorner> bordersOf,
+                                                NativeList<HotspotGroups.Group> groups, NativeList<HotspotSectionLine> lines,
+                                                NativeList<HotspotSectionHalfPlane> halfPlanes, NativeList<HotspotSectionCell> cells,
+                                                NativeArray<float4> tileSides, NativeArray<HotspotLayoutData> layouts, NativeArray<ulong> variants)
+        {
+            work.result = Cut(brushes[work.brush].brushRenderBuffer, work.brush, groupOf, unfoldOf, bordersOf, groups, lines, halfPlanes, cells,
+                              tileSides, layouts, variants);
+            return work;
+        }
+
+        // The cuts handed to the brushes: kept by the cache, or by patched to be freed after the meshes are made; then the
+        // cache forgets the brushes this update did not cut
+        public static void FinishCut(NativeList<BrushData> brushes, NativeList<BlobAssetReference<ChiselBrushRenderBuffer>> patched,
+                                     NativeList<HotspotCutWork> work, NativeParallelHashMap<CompactNodeID, HotspotCutEntry> cache)
+        {
+            var cached = cache.IsCreated;
+            for (int i = 0; i < work.Length; i++)
+            {
+                var item = work[i];
+                var b = item.brush;
+                if (item.keyed && cached)
+                {
+                    var nodeID = brushes[b].brushIndexOrder.compactNodeID;
+                    if (cache.TryGetValue(nodeID, out var old) && old.result.IsCreated)
+                        old.result.Dispose();
+                    cache[nodeID] = new HotspotCutEntry { key = item.key, result = item.result, used = true };
                 }
                 else
-                {
-                    copy = Cut(brushes[b].brushRenderBuffer, b, groupOf, unfoldOf, bordersOf, groups, lines, halfPlanes, cells, tileSides, layouts, variants);
-                    if (keyed)
-                    {
-                        if (cache.TryGetValue(nodeID, out var old) && old.result.IsCreated)
-                            old.result.Dispose();
-                        cache[nodeID] = new HotspotCutEntry { key = key, result = copy, used = true };
-                    }
-                    else
-                        patched.Add(copy);
-                }
+                    patched.Add(item.result);
                 var data = brushes[b];
-                data.brushRenderBuffer = copy;
+                data.brushRenderBuffer = item.result;
                 brushes[b] = data;
             }
-            if (cached)
+            if (!cached)
+                return;
+            using var gone = new NativeList<CompactNodeID>(Allocator.Temp);
+            foreach (var pair in cache)
             {
-                // the brushes this update did not cut are gone, or are not cut any more
-                using var gone = new NativeList<CompactNodeID>(Allocator.Temp);
-                foreach (var pair in cache)
-                {
-                    if (!pair.Value.used)
-                        gone.Add(pair.Key);
-                }
-                foreach (var id in gone)
-                {
-                    if (cache.TryGetValue(id, out var dead) && dead.result.IsCreated)
-                        dead.result.Dispose();
-                    cache.Remove(id);
-                }
-                using var left = cache.GetKeyArray(Allocator.Temp);
-                foreach (var id in left)
-                {
-                    var kept2 = cache[id];
-                    kept2.used = false;
-                    cache[id] = kept2;
-                }
+                if (!pair.Value.used)
+                    gone.Add(pair.Key);
             }
-            groupOf.Dispose(); unfoldOf.Dispose(); bordersOf.Dispose(); groups.Dispose(); lines.Dispose(); halfPlanes.Dispose(); cells.Dispose();
+            foreach (var id in gone)
+            {
+                if (cache.TryGetValue(id, out var dead) && dead.result.IsCreated)
+                    dead.result.Dispose();
+                cache.Remove(id);
+            }
+            using var left = cache.GetKeyArray(Allocator.Temp);
+            foreach (var id in left)
+            {
+                var entry = cache[id];
+                entry.used = false;
+                cache[id] = entry;
+            }
         }
 
         // The size of a blob's data: it sits in the header in front of it (Unity.Entities BlobAssetHeader, 32 bytes, Length at 8)

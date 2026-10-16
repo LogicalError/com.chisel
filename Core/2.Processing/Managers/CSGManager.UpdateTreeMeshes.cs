@@ -288,6 +288,8 @@ namespace Chisel.Core
                 public NativeList<BrushData>                brushRenderData;
                 // The copies of brush buffers the weld across the model changed (OutputModelWeld), written with brushRenderData
                 public NativeList<BlobAssetReference<ChiselBrushRenderBuffer>> patchedRenderBuffers;
+                // The model's hotspot groups and the brushes left to cut, written with brushRenderData
+                public HotspotCutState                      hotspotCut;
                 public NativeList<SubMeshDescriptions>      subMeshDescriptions;
                 public NativeArray<UnsafeList<SubMeshSurface>> subMeshSurfaces;
 
@@ -648,6 +650,7 @@ namespace Chisel.Core
 
                 Temporaries.subMeshSurfaces = new NativeArray<UnsafeList<SubMeshSurface>>(Temporaries.meshQueriesLength, defaultAllocator);
                 Temporaries.patchedRenderBuffers = new NativeList<BlobAssetReference<ChiselBrushRenderBuffer>>(defaultAllocator);
+                Temporaries.hotspotCut = HotspotCutState.Create(defaultAllocator);
                 
                 Temporaries.subMeshDescriptions.Clear();
 
@@ -2443,7 +2446,8 @@ namespace Chisel.Core
                         // Read/Write
                         surfaceCountRef = Temporaries.surfaceCountRef,
                         collapseMoves   = chiselLookupValues.collapseMoves,
-                        hotspotCutCache = chiselLookupValues.hotspotCutCache
+                        hotspotCutCache = chiselLookupValues.hotspotCutCache,
+                        hotspotCut      = Temporaries.hotspotCut
                     };
                     findBrushRenderBuffersJob.Schedule(runInParallel,
                         JobHandles.Read(
@@ -2454,6 +2458,42 @@ namespace Chisel.Core
                         JobHandles.Write(
                             JobHandleType.brushRenderDataJobHandle,
                             JobHandleType.surfaceCountRefJobHandle));
+
+                    var cutHotspotBrushesJob = new CutHotspotBrushesJob
+                    {
+                        // Read
+                        brushRenderData  = Temporaries.brushRenderData.AsDeferredJobArray(),
+                        hotspotLayouts   = Temporaries.hotspotLayouts,
+                        hotspotTileSides = Temporaries.hotspotTileSides,
+                        hotspotVariants  = Temporaries.hotspotVariants,
+                        groupOf          = Temporaries.hotspotCut.groupOfRef,
+                        unfoldOf         = Temporaries.hotspotCut.unfoldOfRef,
+                        bordersOf        = Temporaries.hotspotCut.bordersOf,
+                        groups           = Temporaries.hotspotCut.groups,
+                        lines            = Temporaries.hotspotCut.lines,
+                        halfPlanes       = Temporaries.hotspotCut.halfPlanes,
+                        cells            = Temporaries.hotspotCut.cells,
+
+                        // Write
+                        work             = Temporaries.hotspotCut.work.AsDeferredJobArray()
+                    };
+                    cutHotspotBrushesJob.Schedule(runInParallel, Temporaries.hotspotCut.work, 1,
+                        JobHandles.Read(JobHandleType.decalVolumesJobHandle),
+                        JobHandles.Write(JobHandleType.brushRenderDataJobHandle));
+
+                    var finishHotspotCutJob = new FinishHotspotCutJob
+                    {
+                        // Read
+                        work                 = Temporaries.hotspotCut.work,
+
+                        // Write
+                        brushRenderData      = Temporaries.brushRenderData,
+                        patchedRenderBuffers = Temporaries.patchedRenderBuffers,
+                        hotspotCutCache      = chiselLookupValues.hotspotCutCache
+                    };
+                    finishHotspotCutJob.Schedule(runInParallel,
+                        JobHandles.Read(JobHandleType.decalVolumesJobHandle),
+                        JobHandles.Write(JobHandleType.brushRenderDataJobHandle));
                 }
                 #endregion
 
@@ -3068,6 +3108,8 @@ namespace Chisel.Core
                 lastJobHandle.AddDependency(Temporaries.patchedRenderBuffers    .DisposeDeep(JobHandle.CombineDependencies(
                                                                                     JobHandles[JobHandleType.subMeshSurfacesJobHandle].readWriteBarrier,
                                                                                     JobHandles[JobHandleType.brushRenderDataJobHandle].readWriteBarrier)));
+                lastJobHandle.AddDependency(Temporaries.hotspotCut.Dispose(JobHandles[JobHandleType.brushRenderDataJobHandle].readWriteBarrier));
+                Temporaries.hotspotCut = default;
                 lastJobHandle.AddDependency(Temporaries.allTreeBrushIndexOrders .SafeDispose(JobHandles[JobHandleType.allTreeBrushIndexOrdersJobHandle].readWriteBarrier));
                 lastJobHandle.AddDependency(Temporaries.staleLoopBrushes        .SafeDispose(JobHandles[JobHandleType.staleLoopBrushesJobHandle].readWriteBarrier));
                 lastJobHandle.AddDependency(Temporaries.propagationStats        .SafeDispose(JobHandles[JobHandleType.staleLoopBrushesJobHandle].readWriteBarrier));

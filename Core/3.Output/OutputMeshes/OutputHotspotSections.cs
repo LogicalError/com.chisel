@@ -36,6 +36,8 @@ namespace Chisel.Core
         public NativeList<HotspotSectionHalfPlane> halfPlanes;
         public NativeList<HotspotSectionCell> cells;
         public NativeList<HotspotCutWork> work;
+        // each brush's own buffer, before the weld's copies (PlanCut's kept)
+        public NativeList<BlobAssetReference<ChiselBrushRenderBuffer>> kept;
 
         public static HotspotCutState Create(Allocator allocator)
         {
@@ -48,7 +50,8 @@ namespace Chisel.Core
                 lines      = new NativeList<HotspotSectionLine>(32, allocator),
                 halfPlanes = new NativeList<HotspotSectionHalfPlane>(64, allocator),
                 cells      = new NativeList<HotspotSectionCell>(32, allocator),
-                work       = new NativeList<HotspotCutWork>(16, allocator)
+                work       = new NativeList<HotspotCutWork>(16, allocator),
+                kept       = new NativeList<BlobAssetReference<ChiselBrushRenderBuffer>>(16, allocator)
             };
         }
 
@@ -65,6 +68,7 @@ namespace Chisel.Core
             if (halfPlanes.IsCreated) halfPlanes.Dispose();
             if (cells.IsCreated)      cells.Dispose();
             if (work.IsCreated)       work.Dispose();
+            if (kept.IsCreated)       kept.Dispose();
         }
 
         public Unity.Jobs.JobHandle Dispose(Unity.Jobs.JobHandle dependency)
@@ -72,7 +76,7 @@ namespace Chisel.Core
             // the maps as the jobs left them, then their references
             if (groupOfRef.IsCreated && unfoldOfRef.IsCreated)
                 dependency = Unity.Jobs.IJobExtensions.Schedule(new DisposeHotspotCutMapsJob { groupOf = groupOfRef, unfoldOf = unfoldOfRef }, dependency);
-            var handles = new NativeArray<Unity.Jobs.JobHandle>(8, Allocator.Temp);
+            var handles = new NativeArray<Unity.Jobs.JobHandle>(9, Allocator.Temp);
             for (int i = 0; i < handles.Length; i++)
                 handles[i] = dependency;
             if (groupOfRef.IsCreated)  handles[0] = groupOfRef.Dispose(dependency);
@@ -83,6 +87,7 @@ namespace Chisel.Core
             if (halfPlanes.IsCreated) handles[5] = halfPlanes.Dispose(dependency);
             if (cells.IsCreated)      handles[6] = cells.Dispose(dependency);
             if (work.IsCreated)       handles[7] = work.Dispose(dependency);
+            if (kept.IsCreated)       handles[8] = kept.Dispose(dependency);
             var all = Unity.Jobs.JobHandle.CombineDependencies(handles);
             handles.Dispose();
             return all;
@@ -137,6 +142,15 @@ namespace Chisel.Core
             HotspotGroups.Borders(brushes, links, ref state.bordersOf);
             HotspotGroups.Find(brushes, tiles, layouts, links, state.bordersOf, ref state.GroupOf, ref state.UnfoldOf, state.groups, state.lines,
                                state.halfPlanes, state.cells, tileSides);
+            PlanCutAfterGroups(brushes, layouts, tileSides, kept, variants, cache, ref state);
+        }
+
+        // The rest of PlanCut, once the model's groups are in state (HotspotGroups.Find, or Prepare, Match and Assemble)
+        public static void PlanCutAfterGroups(NativeList<BrushData> brushes, NativeArray<HotspotLayoutData> layouts, NativeArray<float4> tileSides,
+                                              NativeArray<BlobAssetReference<ChiselBrushRenderBuffer>> kept, NativeArray<ulong> variants,
+                                              NativeParallelHashMap<CompactNodeID, HotspotCutEntry> cache, ref HotspotCutState state)
+        {
+            state.work.Clear();
             var groupOf = state.GroupOf;
             var groups  = state.groups;
             for (int b = 0; kept.IsCreated && b < kept.Length && b < brushes.Length; b++)

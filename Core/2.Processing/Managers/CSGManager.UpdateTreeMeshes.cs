@@ -290,6 +290,10 @@ namespace Chisel.Core
                 public NativeList<BlobAssetReference<ChiselBrushRenderBuffer>> patchedRenderBuffers;
                 // The model's hotspot groups and the brushes left to cut, written with brushRenderData
                 public HotspotCutState                      hotspotCut;
+                // The surfaces the weld changed and the brushes to store again, written with brushRenderData
+                public WeldState                            weld;
+                // The model's hotspot groups before they are matched, written with brushRenderData
+                public FindState                            hotspotFind;
                 public NativeList<SubMeshDescriptions>      subMeshDescriptions;
                 public NativeArray<UnsafeList<SubMeshSurface>> subMeshSurfaces;
 
@@ -651,6 +655,8 @@ namespace Chisel.Core
                 Temporaries.subMeshSurfaces = new NativeArray<UnsafeList<SubMeshSurface>>(Temporaries.meshQueriesLength, defaultAllocator);
                 Temporaries.patchedRenderBuffers = new NativeList<BlobAssetReference<ChiselBrushRenderBuffer>>(defaultAllocator);
                 Temporaries.hotspotCut = HotspotCutState.Create(defaultAllocator);
+                Temporaries.weld = WeldState.Create(defaultAllocator);
+                Temporaries.hotspotFind = FindState.Create(defaultAllocator);
                 
                 Temporaries.subMeshDescriptions.Clear();
 
@@ -2433,21 +2439,14 @@ namespace Chisel.Core
                         meshQueryLength         = Temporaries.meshQueriesLength,
                         allTreeBrushIndexOrders = Temporaries.allTreeBrushIndexOrders,
                         brushRenderBufferCache  = chiselLookupValues.brushRenderBufferCache,
-                        hotspotTiles            = Temporaries.hotspotTiles,
-                        hotspotLayouts          = Temporaries.hotspotLayouts,
-                        hotspotLinks            = Temporaries.hotspotLinks,
-                        hotspotTileSides        = Temporaries.hotspotTileSides,
-                        hotspotVariants         = Temporaries.hotspotVariants,
 
                         // Write
                         brushRenderData      = Temporaries.brushRenderData,
-                        patchedRenderBuffers = Temporaries.patchedRenderBuffers,
 
                         // Read/Write
                         surfaceCountRef = Temporaries.surfaceCountRef,
                         collapseMoves   = chiselLookupValues.collapseMoves,
-                        hotspotCutCache = chiselLookupValues.hotspotCutCache,
-                        hotspotCut      = Temporaries.hotspotCut
+                        weld            = Temporaries.weld
                     };
                     findBrushRenderBuffersJob.Schedule(runInParallel,
                         JobHandles.Read(
@@ -2458,6 +2457,76 @@ namespace Chisel.Core
                         JobHandles.Write(
                             JobHandleType.brushRenderDataJobHandle,
                             JobHandleType.surfaceCountRefJobHandle));
+
+                    var copyWeldedBrushesJob = new CopyWeldedBrushesJob
+                    {
+                        // Read
+                        brushRenderData = Temporaries.brushRenderData.AsDeferredJobArray(),
+                        work            = Temporaries.weld.work,
+                        workIndex       = Temporaries.weld.workIndex,
+
+                        // Write
+                        copies          = Temporaries.weld.copies.AsDeferredJobArray()
+                    };
+                    copyWeldedBrushesJob.Schedule(runInParallel, Temporaries.weld.copies, 1,
+                        JobHandles.Read(JobHandleType.decalVolumesJobHandle),
+                        JobHandles.Write(JobHandleType.brushRenderDataJobHandle));
+
+                    var prepareHotspotGroupsJob = new PrepareHotspotGroupsJob
+                    {
+                        // Read
+                        weldCopies     = Temporaries.weld.copies,
+                        hotspotTiles   = Temporaries.hotspotTiles,
+                        hotspotLayouts = Temporaries.hotspotLayouts,
+                        hotspotLinks   = Temporaries.hotspotLinks,
+
+                        // Write
+                        brushRenderData      = Temporaries.brushRenderData,
+                        patchedRenderBuffers = Temporaries.patchedRenderBuffers,
+                        hotspotCut           = Temporaries.hotspotCut,
+                        hotspotFind          = Temporaries.hotspotFind
+                    };
+                    prepareHotspotGroupsJob.Schedule(runInParallel,
+                        JobHandles.Read(JobHandleType.decalVolumesJobHandle),
+                        JobHandles.Write(JobHandleType.brushRenderDataJobHandle));
+
+                    var matchHotspotGroupsJob = new MatchHotspotGroupsJob
+                    {
+                        // Read
+                        brushRenderData  = Temporaries.brushRenderData.AsDeferredJobArray(),
+                        hotspotTiles     = Temporaries.hotspotTiles,
+                        hotspotLayouts   = Temporaries.hotspotLayouts,
+                        hotspotTileSides = Temporaries.hotspotTileSides,
+                        bordersOf        = Temporaries.hotspotCut.bordersOf,
+                        candidates       = Temporaries.hotspotFind.candidates,
+                        unfold           = Temporaries.hotspotFind.unfold,
+                        memberStart      = Temporaries.hotspotFind.memberStart,
+                        memberOf         = Temporaries.hotspotFind.memberOf,
+                        leads            = Temporaries.hotspotFind.leads,
+
+                        // Write
+                        matches          = Temporaries.hotspotFind.matches.AsDeferredJobArray()
+                    };
+                    matchHotspotGroupsJob.Schedule(runInParallel, Temporaries.hotspotFind.matches, 1,
+                        JobHandles.Read(JobHandleType.decalVolumesJobHandle),
+                        JobHandles.Write(JobHandleType.brushRenderDataJobHandle));
+
+                    var planHotspotCutJob = new PlanHotspotCutJob
+                    {
+                        // Read
+                        hotspotLayouts   = Temporaries.hotspotLayouts,
+                        hotspotTileSides = Temporaries.hotspotTileSides,
+                        hotspotVariants  = Temporaries.hotspotVariants,
+
+                        // Write
+                        brushRenderData = Temporaries.brushRenderData,
+                        hotspotCutCache = chiselLookupValues.hotspotCutCache,
+                        hotspotCut      = Temporaries.hotspotCut,
+                        hotspotFind     = Temporaries.hotspotFind
+                    };
+                    planHotspotCutJob.Schedule(runInParallel,
+                        JobHandles.Read(JobHandleType.decalVolumesJobHandle),
+                        JobHandles.Write(JobHandleType.brushRenderDataJobHandle));
 
                     var cutHotspotBrushesJob = new CutHotspotBrushesJob
                     {
@@ -3110,6 +3179,10 @@ namespace Chisel.Core
                                                                                     JobHandles[JobHandleType.brushRenderDataJobHandle].readWriteBarrier)));
                 lastJobHandle.AddDependency(Temporaries.hotspotCut.Dispose(JobHandles[JobHandleType.brushRenderDataJobHandle].readWriteBarrier));
                 Temporaries.hotspotCut = default;
+                lastJobHandle.AddDependency(Temporaries.weld.Dispose(JobHandles[JobHandleType.brushRenderDataJobHandle].readWriteBarrier));
+                Temporaries.weld = default;
+                lastJobHandle.AddDependency(Temporaries.hotspotFind.Dispose(JobHandles[JobHandleType.brushRenderDataJobHandle].readWriteBarrier));
+                Temporaries.hotspotFind = default;
                 lastJobHandle.AddDependency(Temporaries.allTreeBrushIndexOrders .SafeDispose(JobHandles[JobHandleType.allTreeBrushIndexOrdersJobHandle].readWriteBarrier));
                 lastJobHandle.AddDependency(Temporaries.staleLoopBrushes        .SafeDispose(JobHandles[JobHandleType.staleLoopBrushesJobHandle].readWriteBarrier));
                 lastJobHandle.AddDependency(Temporaries.propagationStats        .SafeDispose(JobHandles[JobHandleType.staleLoopBrushesJobHandle].readWriteBarrier));

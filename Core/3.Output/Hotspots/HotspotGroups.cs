@@ -17,6 +17,92 @@ namespace Chisel.Core
         public bool   world;        // repeats on a grid fixed in the tree (the texture not locked to the object)
     }
 
+    // A group matched on its own (HotspotGroups.Match): its sections until they are put in the model's flat lists
+    internal struct GroupMatch
+    {
+        public HotspotGroups.Group group;
+        public bool valid, hasSections;
+        public UnsafeList<HotspotSectionLine> lines;
+        public UnsafeList<HotspotSectionHalfPlane> halfPlanes;
+        public UnsafeList<HotspotSectionCell> cells;
+
+        public void Dispose()
+        {
+            if (lines.IsCreated)      lines.Dispose();
+            if (halfPlanes.IsCreated) halfPlanes.Dispose();
+            if (cells.IsCreated)      cells.Dispose();
+        }
+    }
+
+    // What HotspotGroups.Prepare finds, read by every group's match
+    internal struct FindState
+    {
+        public NativeList<int2>      candidates;
+        public NativeList<float4x4>  unfold;
+        public NativeList<int>       memberStart, memberOf, leads;
+        public NativeList<GroupMatch> matches;
+
+        public static FindState Create(Allocator allocator)
+        {
+            return new FindState
+            {
+                candidates  = new NativeList<int2>(64, allocator),
+                unfold      = new NativeList<float4x4>(64, allocator),
+                memberStart = new NativeList<int>(64, allocator),
+                memberOf    = new NativeList<int>(64, allocator),
+                leads       = new NativeList<int>(16, allocator),
+                matches     = new NativeList<GroupMatch>(16, allocator)
+            };
+        }
+
+        internal static void FreeMatches(NativeList<GroupMatch> matches)
+        {
+            for (int i = 0; i < matches.Length; i++)
+                matches[i].Dispose();
+        }
+
+        public void Clear()
+        {
+            FreeMatches(matches);
+            candidates.Clear(); unfold.Clear(); memberStart.Clear(); memberOf.Clear(); leads.Clear(); matches.Clear();
+        }
+
+        public void Dispose()
+        {
+            if (matches.IsCreated) { FreeMatches(matches); matches.Dispose(); }
+            if (candidates.IsCreated)  candidates.Dispose();
+            if (unfold.IsCreated)      unfold.Dispose();
+            if (memberStart.IsCreated) memberStart.Dispose();
+            if (memberOf.IsCreated)    memberOf.Dispose();
+            if (leads.IsCreated)       leads.Dispose();
+        }
+
+        public Unity.Jobs.JobHandle Dispose(Unity.Jobs.JobHandle dependency)
+        {
+            if (matches.IsCreated)
+                dependency = Unity.Jobs.IJobExtensions.Schedule(new FreeGroupMatchesJob { matches = matches }, dependency);
+            var handles = new NativeArray<Unity.Jobs.JobHandle>(6, Allocator.Temp);
+            for (int i = 0; i < handles.Length; i++)
+                handles[i] = dependency;
+            if (matches.IsCreated)     handles[0] = matches.Dispose(dependency);
+            if (candidates.IsCreated)  handles[1] = candidates.Dispose(dependency);
+            if (unfold.IsCreated)      handles[2] = unfold.Dispose(dependency);
+            if (memberStart.IsCreated) handles[3] = memberStart.Dispose(dependency);
+            if (memberOf.IsCreated)    handles[4] = memberOf.Dispose(dependency);
+            if (leads.IsCreated)       handles[5] = leads.Dispose(dependency);
+            var all = Unity.Jobs.JobHandle.CombineDependencies(handles);
+            handles.Dispose();
+            return all;
+        }
+    }
+
+    [Unity.Burst.BurstCompile]
+    struct FreeGroupMatchesJob : Unity.Jobs.IJob
+    {
+        public NativeList<GroupMatch> matches;
+        public void Execute() { FindState.FreeMatches(matches); }
+    }
+
     // Coplanar neighbouring surfaces, of any brush in the model, with the same hotspot layout and frame are connected:
     // mapped as one surface on one tile, with the first one's settings, the border only along their outline together. By hand
     // (HotspotLink) two touching surfaces are connected whatever their frames, or kept apart; the newest link counts.
@@ -142,9 +228,27 @@ namespace Chisel.Core
                                 in UnsafeParallelMultiHashMap<int2, HotspotBorderCorner> bordersOf, ref UnsafeHashMap<int2, int> groupOf, ref UnsafeHashMap<int2, float4x4> unfoldOf, NativeList<Group> groups, NativeList<HotspotSectionLine> lines,
                                 NativeList<HotspotSectionHalfPlane> halfPlanes, NativeList<HotspotSectionCell> cells, NativeArray<float4> tileSides = default)
         {
-            groupOf.Clear();
-            unfoldOf.Clear();
-            groups.Clear();
+            var state = FindState.Create(Allocator.Temp);
+            try
+            {
+                Prepare(brushes, tiles, layouts, links, ref state);
+                var matches = state.matches.AsArray();
+                for (int i = 0; i < matches.Length; i++)
+                    matches[i] = Match(state.leads[i], brushes.AsArray(), tiles, layouts, tileSides, bordersOf, state);
+                Assemble(ref state, ref groupOf, ref unfoldOf, groups, lines, halfPlanes, cells);
+            }
+            finally
+            {
+                state.Dispose();
+            }
+        }
+
+        // Everything Find does but matching the groups (Match): the candidates, who is grouped with whom, how each is
+        // unfolded, and the groups to match (state.leads)
+        public static void Prepare(NativeList<BrushData> brushes, NativeArray<HotspotTileData> tiles, NativeArray<HotspotLayoutData> layouts,
+                                   NativeArray<HotspotLink> links, ref FindState state)
+        {
+            state.Clear();
             if (!tiles.IsCreated || !layouts.IsCreated)
                 return;
             // the slivers last, so a group always has a surface that shows its tile first
@@ -418,13 +522,42 @@ namespace Chisel.Core
             for (int c = 0; c < candidates.Length; c++)
                 memberOf[memberAt[Root(c)]++] = c;
             memberAt.Dispose();
-            var members   = new NativeList<int>(16, Allocator.Temp);
-            var positions = new NativeList<float3>(64, Allocator.Temp);
-            var indices   = new NativeList<int>(64, Allocator.Temp);
-            var rules     = new NativeList<HotspotBorderCorner>(8, Allocator.Temp);
+            for (int c = 0; c < candidates.Length; c++)
+            {
+                state.candidates.Add(candidates[c]);
+                state.unfold.Add(unfold[c]);
+                state.memberOf.Add(memberOf[c]);
+            }
+            for (int c = 0; c <= candidates.Length; c++)
+                state.memberStart.Add(memberStart[c]);
+            for (int lead = 0; lead < candidates.Length; lead++)
+            {
+                if (Root(lead) == lead && size[lead] >= 2)
+                    state.leads.Add(lead);
+            }
+            state.matches.Resize(state.leads.Length, NativeArrayOptions.ClearMemory);
+            memberStart.Dispose();
+            memberOf.Dispose();
+            size.Dispose();
+            unfold.Dispose();
+            parent.Dispose();
+            candidates.Dispose();
+        }
+
+        // One group matched as one surface on its first member's settings; each is independent of the others
+        public static GroupMatch Match(int lead, NativeArray<BrushData> brushes, NativeArray<HotspotTileData> tiles, NativeArray<HotspotLayoutData> layouts,
+                                       NativeArray<float4> tileSides, in UnsafeParallelMultiHashMap<int2, HotspotBorderCorner> bordersOf, in FindState state)
+        {
+            var result      = default(GroupMatch);
+            var candidates  = state.candidates;
+            var unfold      = state.unfold;
+            var members     = new NativeList<int>(16, Allocator.Temp);
+            var positions   = new NativeList<float3>(64, Allocator.Temp);
+            var indices     = new NativeList<int>(64, Allocator.Temp);
+            var rules       = new NativeList<HotspotBorderCorner>(8, Allocator.Temp);
             var memberRules = new NativeList<HotspotBorderCorner>(8, Allocator.Temp);
             // where each corner was unfolded to first: the edge two members share is the same in both
-            var placed    = new UnsafeHashMap<float3, float3>(64, Allocator.Temp);
+            var placed      = new UnsafeHashMap<float3, float3>(64, Allocator.Temp);
             float3 Place(float3 p, float4x4 map)
             {
                 p += 0.0f;
@@ -434,14 +567,11 @@ namespace Chisel.Core
                 placed.TryAdd(p, q);
                 return q;
             }
-            for (int lead = 0; lead < candidates.Length; lead++)
+            try
             {
-                if (Root(lead) != lead || size[lead] < 2)
-                    continue;
-                members.Clear(); positions.Clear(); indices.Clear(); rules.Clear(); placed.Clear();
-                for (int k = memberStart[lead]; k < memberStart[lead + 1]; k++)
+                for (int k = state.memberStart[lead]; k < state.memberStart[lead + 1]; k++)
                 {
-                    var c = memberOf[k];
+                    var c = state.memberOf[k];
                     members.Add(c);
                     ref var surface = ref brushes[candidates[c].x].brushRenderBuffer.Value.surfaces[candidates[c].y];
                     var first = positions.Length;
@@ -469,7 +599,7 @@ namespace Chisel.Core
                 HotspotMatcher.MaskOf(ref shape, positions.AsArray(), indices.AsArray(), source.right, source.up);
                 var choice  = HotspotMatcher.Choose(tiles, layout, shape, source.seed, source.pinned, density: density, pinnedSheet: source.pinnedSheet);
                 if (choice.tile < 0)
-                    continue;
+                    return result;
                 var tile  = tiles[choice.tile];
                 var sheetMaterial = 0UL;
                 if (tile.sheet > 0)
@@ -501,30 +631,58 @@ namespace Chisel.Core
                         group.interiorCell    = sections.interiorCell;
                         group.interiorToEdges = sections.interiorToEdges;
                         group.openSides       = sections.openSides;
-                        group.sectionStart = new int3(lines.Length, halfPlanes.Length, cells.Length);
-                        group.sectionCount = new int3(sections.lines.Length, sections.halfPlanes.Length, sections.cells.Length);
-                        lines.AddRange(sections.lines.AsArray());
-                        halfPlanes.AddRange(sections.halfPlanes.AsArray());
-                        cells.AddRange(sections.cells.AsArray());
+                        result.hasSections = true;
+                        result.lines      = new UnsafeList<HotspotSectionLine>(sections.lines.Length, Allocator.Persistent);
+                        result.halfPlanes = new UnsafeList<HotspotSectionHalfPlane>(sections.halfPlanes.Length, Allocator.Persistent);
+                        result.cells      = new UnsafeList<HotspotSectionCell>(sections.cells.Length, Allocator.Persistent);
+                        for (int i = 0; i < sections.lines.Length; i++)      result.lines.Add(sections.lines[i]);
+                        for (int i = 0; i < sections.halfPlanes.Length; i++) result.halfPlanes.Add(sections.halfPlanes[i]);
+                        for (int i = 0; i < sections.cells.Length; i++)      result.cells.Add(sections.cells[i]);
                     }
                     sections.Dispose();
                 }
+                result.group = group;
+                result.valid = true;
+                return result;
+            }
+            finally
+            {
+                members.Dispose(); positions.Dispose(); indices.Dispose(); rules.Dispose(); memberRules.Dispose(); placed.Dispose();
+            }
+        }
+
+        // The matched groups in the model's order, their sections in the flat lists, and which group each member is in
+        public static void Assemble(ref FindState state, ref UnsafeHashMap<int2, int> groupOf, ref UnsafeHashMap<int2, float4x4> unfoldOf, NativeList<Group> groups,
+                                    NativeList<HotspotSectionLine> lines, NativeList<HotspotSectionHalfPlane> halfPlanes, NativeList<HotspotSectionCell> cells)
+        {
+            groupOf.Clear();
+            unfoldOf.Clear();
+            groups.Clear();
+            for (int i = 0; i < state.matches.Length; i++)
+            {
+                var match = state.matches[i];
+                if (!match.valid)
+                    continue;
+                var group = match.group;
+                if (match.hasSections)
+                {
+                    group.sectionStart = new int3(lines.Length, halfPlanes.Length, cells.Length);
+                    group.sectionCount = new int3(match.lines.Length, match.halfPlanes.Length, match.cells.Length);
+                    for (int k = 0; k < match.lines.Length; k++)      lines.Add(match.lines[k]);
+                    for (int k = 0; k < match.halfPlanes.Length; k++) halfPlanes.Add(match.halfPlanes[k]);
+                    for (int k = 0; k < match.cells.Length; k++)      cells.Add(match.cells[k]);
+                }
                 var index = groups.Length;
                 groups.Add(group);
-                for (int m = 0; m < members.Length; m++)
+                var lead = state.leads[i];
+                for (int k = state.memberStart[lead]; k < state.memberStart[lead + 1]; k++)
                 {
-                    groupOf.TryAdd(candidates[members[m]], index);
-                    if (!unfold[members[m]].Equals(float4x4.identity))
-                        unfoldOf.TryAdd(candidates[members[m]], unfold[members[m]]);
+                    var c = state.memberOf[k];
+                    groupOf.TryAdd(state.candidates[c], index);
+                    if (!state.unfold[c].Equals(float4x4.identity))
+                        unfoldOf.TryAdd(state.candidates[c], state.unfold[c]);
                 }
             }
-            members.Dispose(); positions.Dispose(); indices.Dispose(); rules.Dispose(); memberRules.Dispose(); placed.Dispose();
-            memberStart.Dispose();
-            memberOf.Dispose();
-            size.Dispose();
-            unfold.Dispose();
-            parent.Dispose();
-            candidates.Dispose();
         }
 
         // The newest link first (connected by themselves before any), then by candidate, so the order never depends on a
@@ -652,6 +810,11 @@ namespace Chisel.Core
         }
 
         static HotspotSurfaceSource SourceOf(NativeList<BrushData> brushes, int2 at)
+        {
+            return brushes[at.x].brushRenderBuffer.Value.surfaces[at.y].hotspotSource;
+        }
+
+        static HotspotSurfaceSource SourceOf(NativeArray<BrushData> brushes, int2 at)
         {
             return brushes[at.x].brushRenderBuffer.Value.surfaces[at.y].hotspotSource;
         }

@@ -5,6 +5,79 @@ using Unity.Mathematics;
 
 namespace Chisel.Core
 {
+    // A brush the weld changed (OutputModelWeld.PlanWeld), and its buffer stored again
+    internal struct WeldCopy
+    {
+        public int brush;
+        public BlobAssetReference<ChiselBrushRenderBuffer> result;
+    }
+
+    // The surfaces the weld changed, kept until their brushes are stored again
+    internal struct WeldState
+    {
+        public NativeList<OutputModelWeld.Working> work;
+        public NativeParallelHashMap<long, int> workIndex;
+        public NativeList<WeldCopy> copies;
+
+        public static WeldState Create(Allocator allocator)
+        {
+            return new WeldState
+            {
+                work      = new NativeList<OutputModelWeld.Working>(16, allocator),
+                workIndex = new NativeParallelHashMap<long, int>(16, allocator),
+                copies    = new NativeList<WeldCopy>(16, allocator)
+            };
+        }
+
+        public void Clear()
+        {
+            FreeWork(work);
+            work.Clear();
+            workIndex.Clear();
+            copies.Clear();
+        }
+
+        internal static void FreeWork(NativeList<OutputModelWeld.Working> work)
+        {
+            for (int k = 0; k < work.Length; k++)
+            {
+                var w = work[k];
+                if (w.indices.IsCreated)  w.indices.Dispose();
+                if (w.collider.IsCreated) w.collider.Dispose();
+                if (w.select.IsCreated)   w.select.Dispose();
+                if (w.render.IsCreated)   w.render.Dispose();
+            }
+        }
+
+        public void Dispose()
+        {
+            if (work.IsCreated)
+            {
+                FreeWork(work);
+                work.Dispose();
+            }
+            if (workIndex.IsCreated) workIndex.Dispose();
+            if (copies.IsCreated)    copies.Dispose();
+        }
+
+        public Unity.Jobs.JobHandle Dispose(Unity.Jobs.JobHandle dependency)
+        {
+            if (work.IsCreated)
+                dependency = Unity.Jobs.IJobExtensions.Schedule(new FreeWeldWorkJob { work = work }, dependency);
+            var a = work.IsCreated      ? work.Dispose(dependency)      : dependency;
+            var b = workIndex.IsCreated ? workIndex.Dispose(dependency) : dependency;
+            var c = copies.IsCreated    ? copies.Dispose(dependency)    : dependency;
+            return Unity.Jobs.JobHandle.CombineDependencies(a, b, c);
+        }
+    }
+
+    [Unity.Burst.BurstCompile]
+    struct FreeWeldWorkJob : Unity.Jobs.IJob
+    {
+        public NativeList<OutputModelWeld.Working> work;
+        public void Execute() { WeldState.FreeWork(work); }
+    }
+
     internal static class OutputModelWeld
     {
         // Edges shorter than this are collapsed, the last step across the model: where many planes
@@ -12,7 +85,7 @@ namespace Chisel.Core
         public const float kCollapseLength = 1e-3f;
 
         // A surface this weld changes: the triangles of one dropped are -1
-        struct Working
+        internal struct Working
         {
             public int                      brush;
             public int                      surface;
@@ -50,12 +123,32 @@ namespace Chisel.Core
         public static void WeldModel(NativeList<BrushData> brushes, NativeList<BlobAssetReference<ChiselBrushRenderBuffer>> patched,
                                      out int split, out int paired, out int cancelled, out int collapsed, NativeList<float3x2> moves = default)
         {
+            var state = WeldState.Create(Allocator.Temp);
+            try
+            {
+                PlanWeld(brushes, ref state, out split, out paired, out cancelled, out collapsed, moves);
+                var copies = state.copies.AsArray();
+                for (int i = 0; i < copies.Length; i++)
+                    copies[i] = CopyPlanned(copies[i], brushes.AsArray(), state.work, state.workIndex);
+                FinishWeld(brushes, patched, state.copies);
+            }
+            finally
+            {
+                state.Dispose();
+            }
+        }
+
+        // Every step of the weld but the copies of the brushes it changed (state.copies, CopyPlanned)
+        public static void PlanWeld(NativeList<BrushData> brushes, ref WeldState state, out int split, out int paired, out int cancelled, out int collapsed,
+                                    NativeList<float3x2> moves = default)
+        {
             if (moves.IsCreated)
                 moves.Clear();
             split = 0;
             paired = 0;
             cancelled = 0;
             collapsed = 0;
+            state.Clear();
             var needles = new NativeList<Needle>(Allocator.Temp);
             for (int b = 0; b < brushes.Length; b++)
             {
@@ -89,8 +182,10 @@ namespace Chisel.Core
                 bounds[b] = box;
             }
 
-            var workIndex = new NativeParallelHashMap<long, int>(needles.Length * 2 + 16, Allocator.Temp);
-            var work      = new NativeList<Working>(Allocator.Temp);
+            var workIndex = state.workIndex;
+            var work      = state.work;
+            if (workIndex.Capacity < needles.Length * 2 + 16)
+                workIndex.Capacity = needles.Length * 2 + 16;
             var opposites = new Opposites(TriangleCount(brushes), Allocator.Temp);
             var fresh     = new NativeList<int3>(Allocator.Temp);
             try
@@ -108,7 +203,7 @@ namespace Chisel.Core
                 // last, away from what the steps above changed
                 CollapseShortEdges(brushes, work, workIndex, ref collapsed, moves);
 
-                // The copies of the brushes it changed
+                // the brushes it changed, each once
                 var copied = new NativeArray<bool>(brushes.Length, Allocator.Temp);
                 for (int k = 0; k < work.Length; k++)
                 {
@@ -116,29 +211,36 @@ namespace Chisel.Core
                     if (copied[brush])
                         continue;
                     copied[brush] = true;
-                    var copy = Copy(brushes[brush].brushRenderBuffer, brush, work, workIndex);
-                    patched.Add(copy);
-                    var data = brushes[brush];
-                    data.brushRenderBuffer = copy;
-                    brushes[brush] = data;
+                    state.copies.Add(new WeldCopy { brush = brush });
                 }
+                copied.Dispose();
             }
             finally
             {
-                for (int k = 0; k < work.Length; k++)
-                {
-                    var w = work[k];
-                    w.indices.Dispose();
-                    w.collider.Dispose();
-                    w.select.Dispose();
-                    w.render.Dispose();
-                }
-                work.Dispose();
-                workIndex.Dispose();
                 opposites.Dispose();
                 fresh.Dispose();
                 bounds.Dispose();
                 needles.Dispose();
+            }
+        }
+
+        // One changed brush's buffer stored again; each is independent of the others
+        public static WeldCopy CopyPlanned(WeldCopy copy, NativeArray<BrushData> brushes, NativeList<Working> work, NativeParallelHashMap<long, int> workIndex)
+        {
+            copy.result = Copy(brushes[copy.brush].brushRenderBuffer, copy.brush, work, workIndex);
+            return copy;
+        }
+
+        // The copies handed to their brushes; patched frees them after the meshes are made
+        public static void FinishWeld(NativeList<BrushData> brushes, NativeList<BlobAssetReference<ChiselBrushRenderBuffer>> patched, NativeList<WeldCopy> copies)
+        {
+            for (int i = 0; i < copies.Length; i++)
+            {
+                var copy = copies[i];
+                patched.Add(copy.result);
+                var data = brushes[copy.brush];
+                data.brushRenderBuffer = copy.result;
+                brushes[copy.brush] = data;
             }
         }
 
@@ -700,10 +802,10 @@ namespace Chisel.Core
             {
                 brush    = brush,
                 surface  = surface,
-                indices  = new UnsafeList<int>(source.indices.Length + 3, Allocator.Temp),
-                collider = new UnsafeList<float3>(source.colliderVertices.Length + 1, Allocator.Temp),
-                select   = new UnsafeList<SelectVertex>(source.selectVertices.Length + 1, Allocator.Temp),
-                render   = new UnsafeList<RenderVertex>(source.renderVertices.Length + 1, Allocator.Temp),
+                indices  = new UnsafeList<int>(source.indices.Length + 3, Allocator.Persistent),
+                collider = new UnsafeList<float3>(source.colliderVertices.Length + 1, Allocator.Persistent),
+                select   = new UnsafeList<SelectVertex>(source.selectVertices.Length + 1, Allocator.Persistent),
+                render   = new UnsafeList<RenderVertex>(source.renderVertices.Length + 1, Allocator.Persistent),
             };
             copy.indices .AddRange(source.indices.GetUnsafePtr(),          source.indices.Length);
             copy.collider.AddRange(source.colliderVertices.GetUnsafePtr(), source.colliderVertices.Length);

@@ -150,6 +150,7 @@ namespace Chisel.Core
         [NoAlias, ReadOnly] public NativeArray<HotspotTileData>   hotspotTiles;
         [NoAlias, ReadOnly] public NativeArray<HotspotLayoutData> hotspotLayouts;
         [NoAlias, ReadOnly] public NativeArray<HotspotLink>       hotspotLinks;
+        [NoAlias, ReadOnly] public NativeArray<float4>            hotspotTileSides;
 
         // Write
         [NoAlias] public NativeList<BrushData> brushRenderData;
@@ -166,6 +167,7 @@ namespace Chisel.Core
             OutputModelWeld.FinishWeld(brushRenderData, patchedRenderBuffers, weldCopies);
             HotspotGroups.Borders(brushRenderData, hotspotLinks, ref hotspotCut.bordersOf);
             HotspotGroups.Prepare(brushRenderData, hotspotTiles, hotspotLayouts, hotspotLinks, ref hotspotFind);
+            hotspotFind.inputs.Value = HotspotGroups.InputsKey(hotspotTiles, hotspotLayouts, hotspotTileSides);
         }
     }
 
@@ -183,13 +185,17 @@ namespace Chisel.Core
         [NoAlias, ReadOnly] public NativeList<int>      memberStart;
         [NoAlias, ReadOnly] public NativeList<int>      memberOf;
         [NoAlias, ReadOnly] public NativeList<int>      leads;
+        [NoAlias, ReadOnly] public NativeReference<uint4> inputs;
+        // what each group was matched with before, kept with the tree
+        [NoAlias, ReadOnly] public NativeParallelHashMap<uint4, GroupMatchEntry> hotspotMatchCache;
 
         [NoAlias] public NativeArray<GroupMatch> matches;
 
         public void Execute(int index)
         {
             var state = new FindState { candidates = candidates, unfold = unfold, memberStart = memberStart, memberOf = memberOf, leads = leads };
-            matches[index] = HotspotGroups.Match(leads[index], brushRenderData, hotspotTiles, hotspotLayouts, hotspotTileSides, bordersOf, state);
+            matches[index] = HotspotGroups.Match(leads[index], brushRenderData, hotspotTiles, hotspotLayouts, hotspotTileSides, bordersOf, state,
+                                                 hotspotMatchCache, inputs.Value);
         }
     }
 
@@ -206,13 +212,16 @@ namespace Chisel.Core
         [NoAlias] public NativeList<BrushData> brushRenderData;
         // what the hotspot cut made of each brush, kept with the tree
         [NoAlias] public NativeParallelHashMap<CompactNodeID, HotspotCutEntry> hotspotCutCache;
+        // what each group was matched with, kept with the tree
+        [NoAlias] public NativeParallelHashMap<uint4, GroupMatchEntry> hotspotMatchCache;
         // the model's hotspot groups and the brushes left to cut (CutHotspotBrushesJob)
         [NoAlias] public HotspotCutState hotspotCut;
         [NoAlias] public FindState       hotspotFind;
 
         public void Execute()
         {
-            HotspotGroups.Assemble(ref hotspotFind, ref hotspotCut.GroupOf, ref hotspotCut.UnfoldOf, hotspotCut.groups, hotspotCut.lines, hotspotCut.halfPlanes, hotspotCut.cells);
+            HotspotGroups.Assemble(ref hotspotFind, ref hotspotCut.GroupOf, ref hotspotCut.UnfoldOf, hotspotCut.groups, hotspotCut.lines, hotspotCut.halfPlanes, hotspotCut.cells,
+                                   hotspotMatchCache);
             // Then what is drawn of hotspot surfaces is cut into its sections; the collider stays as welded
             OutputHotspotSections.PlanCutAfterGroups(brushRenderData, hotspotLayouts, hotspotTileSides, hotspotCut.kept.AsArray(), hotspotVariants, hotspotCutCache, ref hotspotCut);
         }

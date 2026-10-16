@@ -2479,6 +2479,7 @@ namespace Chisel.Core
                         hotspotTiles   = Temporaries.hotspotTiles,
                         hotspotLayouts = Temporaries.hotspotLayouts,
                         hotspotLinks   = Temporaries.hotspotLinks,
+                        hotspotTileSides = Temporaries.hotspotTileSides,
 
                         // Write
                         brushRenderData      = Temporaries.brushRenderData,
@@ -2503,6 +2504,8 @@ namespace Chisel.Core
                         memberStart      = Temporaries.hotspotFind.memberStart,
                         memberOf         = Temporaries.hotspotFind.memberOf,
                         leads            = Temporaries.hotspotFind.leads,
+                        inputs           = Temporaries.hotspotFind.inputs,
+                        hotspotMatchCache = chiselLookupValues.hotspotMatchCache,
 
                         // Write
                         matches          = Temporaries.hotspotFind.matches.AsDeferredJobArray()
@@ -2521,6 +2524,7 @@ namespace Chisel.Core
                         // Write
                         brushRenderData = Temporaries.brushRenderData,
                         hotspotCutCache = chiselLookupValues.hotspotCutCache,
+                        hotspotMatchCache = chiselLookupValues.hotspotMatchCache,
                         hotspotCut      = Temporaries.hotspotCut,
                         hotspotFind     = Temporaries.hotspotFind
                     };

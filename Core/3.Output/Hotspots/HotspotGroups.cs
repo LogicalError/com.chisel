@@ -25,6 +25,9 @@ namespace Chisel.Core
         public UnsafeList<HotspotSectionLine> lines;
         public UnsafeList<HotspotSectionHalfPlane> halfPlanes;
         public UnsafeList<HotspotSectionCell> cells;
+        // what it was made from (keyed: with a cache); owned: its sections are its own, not the cache's
+        public uint4 key;
+        public bool keyed, owned;
 
         public void Dispose()
         {
@@ -34,6 +37,13 @@ namespace Chisel.Core
         }
     }
 
+    // A group's match, kept with the tree while its inputs stay the same (HotspotGroups.Match)
+    internal struct GroupMatchEntry
+    {
+        public GroupMatch match;
+        public bool used;
+    }
+
     // What HotspotGroups.Prepare finds, read by every group's match
     internal struct FindState
     {
@@ -41,6 +51,8 @@ namespace Chisel.Core
         public NativeList<float4x4>  unfold;
         public NativeList<int>       memberStart, memberOf, leads;
         public NativeList<GroupMatch> matches;
+        // what every match reads (InputsKey)
+        public NativeReference<uint4> inputs;
 
         public static FindState Create(Allocator allocator)
         {
@@ -51,14 +63,18 @@ namespace Chisel.Core
                 memberStart = new NativeList<int>(64, allocator),
                 memberOf    = new NativeList<int>(64, allocator),
                 leads       = new NativeList<int>(16, allocator),
-                matches     = new NativeList<GroupMatch>(16, allocator)
+                matches     = new NativeList<GroupMatch>(16, allocator),
+                inputs      = new NativeReference<uint4>(allocator)
             };
         }
 
         internal static void FreeMatches(NativeList<GroupMatch> matches)
         {
             for (int i = 0; i < matches.Length; i++)
-                matches[i].Dispose();
+            {
+                if (matches[i].owned)
+                    matches[i].Dispose();
+            }
         }
 
         public void Clear()
@@ -75,13 +91,14 @@ namespace Chisel.Core
             if (memberStart.IsCreated) memberStart.Dispose();
             if (memberOf.IsCreated)    memberOf.Dispose();
             if (leads.IsCreated)       leads.Dispose();
+            if (inputs.IsCreated)      inputs.Dispose();
         }
 
         public Unity.Jobs.JobHandle Dispose(Unity.Jobs.JobHandle dependency)
         {
             if (matches.IsCreated)
                 dependency = Unity.Jobs.IJobExtensions.Schedule(new FreeGroupMatchesJob { matches = matches }, dependency);
-            var handles = new NativeArray<Unity.Jobs.JobHandle>(6, Allocator.Temp);
+            var handles = new NativeArray<Unity.Jobs.JobHandle>(7, Allocator.Temp);
             for (int i = 0; i < handles.Length; i++)
                 handles[i] = dependency;
             if (matches.IsCreated)     handles[0] = matches.Dispose(dependency);
@@ -90,6 +107,7 @@ namespace Chisel.Core
             if (memberStart.IsCreated) handles[3] = memberStart.Dispose(dependency);
             if (memberOf.IsCreated)    handles[4] = memberOf.Dispose(dependency);
             if (leads.IsCreated)       handles[5] = leads.Dispose(dependency);
+            if (inputs.IsCreated)      handles[6] = inputs.Dispose(dependency);
             var all = Unity.Jobs.JobHandle.CombineDependencies(handles);
             handles.Dispose();
             return all;
@@ -546,11 +564,24 @@ namespace Chisel.Core
 
         // One group matched as one surface on its first member's settings; each is independent of the others
         public static GroupMatch Match(int lead, NativeArray<BrushData> brushes, NativeArray<HotspotTileData> tiles, NativeArray<HotspotLayoutData> layouts,
-                                       NativeArray<float4> tileSides, in UnsafeParallelMultiHashMap<int2, HotspotBorderCorner> bordersOf, in FindState state)
+                                       NativeArray<float4> tileSides, in UnsafeParallelMultiHashMap<int2, HotspotBorderCorner> bordersOf, in FindState state,
+                                       NativeParallelHashMap<uint4, GroupMatchEntry> cache = default, uint4 inputs = default)
         {
             var result      = default(GroupMatch);
             var candidates  = state.candidates;
             var unfold      = state.unfold;
+            if (cache.IsCreated)
+            {
+                result.key   = MatchKey(lead, brushes, bordersOf, state, inputs);
+                result.keyed = true;
+                if (cache.TryGetValue(result.key, out var entry))
+                {
+                    var kept = entry.match;
+                    kept.owned = false;
+                    return kept;
+                }
+            }
+            result.owned = true;
             var members     = new NativeList<int>(16, Allocator.Temp);
             var positions   = new NativeList<float3>(64, Allocator.Temp);
             var indices     = new NativeList<int>(64, Allocator.Temp);
@@ -651,9 +682,61 @@ namespace Chisel.Core
             }
         }
 
+        // Everything Match reads of a group: its first member's settings, and each member's corners, triangles, unfold and
+        // borders given by hand; inputs: what every match reads (InputsKey)
+        static unsafe uint4 MatchKey(int lead, NativeArray<BrushData> brushes, in UnsafeParallelMultiHashMap<int2, HotspotBorderCorner> bordersOf,
+                                     in FindState state, uint4 inputs)
+        {
+            var buffer = new UnsafeAppendBuffer(1024, 16, Allocator.Temp);
+            var rules  = new NativeList<HotspotBorderCorner>(8, Allocator.Temp);
+            try
+            {
+                buffer.Add(inputs);
+                var source = SourceOf(brushes, state.candidates[lead]);
+                buffer.Add(source.layout); buffer.Add(source.right); buffer.Add(source.up); buffer.Add(source.normal);
+                buffer.Add(source.seed); buffer.Add(source.pinned); buffer.Add(source.pinnedSheet); buffer.Add(source.density);
+                buffer.Add(source.offset); buffer.Add(source.world ? 1 : 0);
+                for (int k = state.memberStart[lead]; k < state.memberStart[lead + 1]; k++)
+                {
+                    var c = state.memberOf[k];
+                    var at = state.candidates[c];
+                    ref var surface = ref brushes[at.x].brushRenderBuffer.Value.surfaces[at.y];
+                    buffer.Add(state.unfold[c]);
+                    buffer.Add(surface.colliderVertices.Length);
+                    buffer.Add(surface.colliderVertices.GetUnsafePtr(), surface.colliderVertices.Length * UnsafeUtility.SizeOf<float3>());
+                    buffer.Add(surface.indices.Length);
+                    buffer.Add(surface.indices.GetUnsafePtr(), surface.indices.Length * sizeof(int));
+                    BordersOf(at, bordersOf, rules);
+                    buffer.Add(rules.Length);
+                    for (int i = 0; i < rules.Length; i++)
+                    {
+                        buffer.Add(rules[i].position); buffer.Add(rules[i].end); buffer.Add(rules[i].segment ? 1 : 0);
+                        buffer.Add(rules[i].rule); buffer.Add(rules[i].border);
+                    }
+                }
+                return xxHash3.Hash128(buffer.Ptr, buffer.Length);
+            }
+            finally
+            {
+                rules.Dispose();
+                buffer.Dispose();
+            }
+        }
+
+        // What every group's match reads: the tiles, the layouts and the shaped tiles' sides
+        public static unsafe uint4 InputsKey(NativeArray<HotspotTileData> tiles, NativeArray<HotspotLayoutData> layouts, NativeArray<float4> tileSides)
+        {
+            var parts = stackalloc uint4[3];
+            parts[0] = tiles.IsCreated && tiles.Length > 0         ? xxHash3.Hash128(tiles.GetUnsafeReadOnlyPtr(), (long)tiles.Length * UnsafeUtility.SizeOf<HotspotTileData>()) : default;
+            parts[1] = layouts.IsCreated && layouts.Length > 0     ? xxHash3.Hash128(layouts.GetUnsafeReadOnlyPtr(), (long)layouts.Length * UnsafeUtility.SizeOf<HotspotLayoutData>()) : default;
+            parts[2] = tileSides.IsCreated && tileSides.Length > 0 ? xxHash3.Hash128(tileSides.GetUnsafeReadOnlyPtr(), (long)tileSides.Length * UnsafeUtility.SizeOf<float4>()) : default;
+            return xxHash3.Hash128(parts, 3 * 16);
+        }
+
         // The matched groups in the model's order, their sections in the flat lists, and which group each member is in
         public static void Assemble(ref FindState state, ref UnsafeHashMap<int2, int> groupOf, ref UnsafeHashMap<int2, float4x4> unfoldOf, NativeList<Group> groups,
-                                    NativeList<HotspotSectionLine> lines, NativeList<HotspotSectionHalfPlane> halfPlanes, NativeList<HotspotSectionCell> cells)
+                                    NativeList<HotspotSectionLine> lines, NativeList<HotspotSectionHalfPlane> halfPlanes, NativeList<HotspotSectionCell> cells,
+                                    NativeParallelHashMap<uint4, GroupMatchEntry> cache = default)
         {
             groupOf.Clear();
             unfoldOf.Clear();
@@ -682,6 +765,48 @@ namespace Chisel.Core
                     if (!state.unfold[c].Equals(float4x4.identity))
                         unfoldOf.TryAdd(state.candidates[c], state.unfold[c]);
                 }
+            }
+            if (!cache.IsCreated)
+                return;
+            // the new matches go to the cache, which then owns their sections
+            for (int i = 0; i < state.matches.Length; i++)
+            {
+                var match = state.matches[i];
+                if (!match.keyed)
+                    continue;
+                if (cache.TryGetValue(match.key, out var entry))
+                {
+                    entry.used = true;
+                    cache[match.key] = entry;
+                    continue;
+                }
+                if (!match.owned)
+                    continue;
+                var stored = match;
+                stored.owned = false;
+                cache.TryAdd(match.key, new GroupMatchEntry { match = stored, used = true });
+                match.owned = false;
+                state.matches[i] = match;
+            }
+            // and forgets the matches no group used
+            using var gone = new NativeList<uint4>(Allocator.Temp);
+            foreach (var pair in cache)
+            {
+                if (!pair.Value.used)
+                    gone.Add(pair.Key);
+            }
+            for (int i = 0; i < gone.Length; i++)
+            {
+                if (cache.TryGetValue(gone[i], out var dead))
+                    dead.match.Dispose();
+                cache.Remove(gone[i]);
+            }
+            using var left = cache.GetKeyArray(Allocator.Temp);
+            for (int i = 0; i < left.Length; i++)
+            {
+                var entry = cache[left[i]];
+                entry.used = false;
+                cache[left[i]] = entry;
             }
         }
 

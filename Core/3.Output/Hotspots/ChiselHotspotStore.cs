@@ -147,10 +147,31 @@ namespace Chisel.Core
             }
         }
 
+        static int2 s_Budgets = new int2(-1, -1);
+
+        static int2 Budgets() { return new int2(ChiselProjectSettings.HotspotMaxRepeats, ChiselProjectSettings.HotspotMaxTriangles); }
+
+        // After an undo or a redo, which put the project's hotspot budgets back without telling anyone: updates the trees
+        // when they differ from those the trees were last told of; true when they did
+        public static bool CheckSettings()
+        {
+            var current = Budgets();
+            if (s_Budgets.x < 0)
+            {
+                s_Budgets = current;
+                return false;
+            }
+            if (current.Equals(s_Budgets))
+                return false;
+            SettingsChanged();
+            return true;
+        }
+
         // The project's hotspot budgets changed: every tree updates, and the brushes drawn on layouts without budgets of
         // their own are mapped again (LayoutHashes)
         public static void SettingsChanged()
         {
+            s_Budgets = Budgets();
             using var trees = new NativeList<CSGTree>(Allocator.Temp);
             CompactHierarchyManager.GetAllTrees(trees);
             foreach (var tree in trees)

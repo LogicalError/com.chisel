@@ -302,7 +302,9 @@ namespace Chisel.Core
                 public NativeList<ChiselMeshUpdate>         meshUpdatesColliders;
                 public NativeList<ChiselMeshUpdate>         meshUpdatesRenderables;
                 public NativeList<ChiselMeshUpdate>         meshUpdatesKept;
+                public NativeList<ChiselMeshUpdate>         meshUpdatesKeptColliders;
                 public NativeArray<bool>                    keptSections;
+                public NativeArray<uint>                    sectionLightmapHashes;
                 public NativeList<ChiselMeshUpdate>         meshUpdatesDebugVisualizations;
 
                 public NativeList<BlobAssetReference<BasePolygonsBlob>>           basePolygonDisposeList;
@@ -631,6 +633,7 @@ namespace Chisel.Core
                 Temporaries.meshUpdatesColliders            = new NativeList<ChiselMeshUpdate>(defaultAllocator);
                 Temporaries.meshUpdatesRenderables          = new NativeList<ChiselMeshUpdate>(defaultAllocator);
                 Temporaries.meshUpdatesKept                 = new NativeList<ChiselMeshUpdate>(defaultAllocator);
+                Temporaries.meshUpdatesKeptColliders        = new NativeList<ChiselMeshUpdate>(defaultAllocator);
                 Temporaries.meshUpdatesDebugVisualizations  = new NativeList<ChiselMeshUpdate>(defaultAllocator);
 
 
@@ -980,7 +983,8 @@ namespace Chisel.Core
 									    meshUpdatesColliders            = treeUpdate.Temporaries.meshUpdatesColliders,
 									    meshUpdatesRenderables          = treeUpdate.Temporaries.meshUpdatesRenderables,
 									    meshUpdatesDebugVisualizations  = treeUpdate.Temporaries.meshUpdatesDebugVisualizations,
-									    meshUpdatesKept                 = treeUpdate.Temporaries.meshUpdatesKept
+									    meshUpdatesKept                 = treeUpdate.Temporaries.meshUpdatesKept,
+									    meshUpdatesKeptColliders        = treeUpdate.Temporaries.meshUpdatesKeptColliders
                                     };
 								    var usedMeshCount = finishMeshUpdates(treeUpdate.tree, meshUpdates, treeUpdate.dependencies);
                                     treeUpdate.Temporaries.meshDataArray = default;
@@ -2693,16 +2697,16 @@ namespace Chisel.Core
                 #endregion
             }
 
-            // Marks the sections whose render mesh is made from the same as last time (Temporaries.keptSections) and
-            // remembers what each was made from; returns how many there are. Only a query's own material meshes are kept:
-            // the shadow-only, debug and collider meshes are always made again.
+            // Marks the sections whose mesh is made from the same as last time (Temporaries.keptSections), remembers what each
+            // was made from, and gives each render mesh the hash of what its lightmap layout is made from
+            // (Temporaries.sectionLightmapHashes); returns how many are kept. A query's own material meshes and the colliders
+            // are kept; the shadow-only and debug meshes are always made again.
             unsafe int FindKeptSections(NativeParallelHashMap<RenderMeshKey, uint4> hashes)
             {
                 var sections     = Temporaries.vertexBufferContents.subMeshSections;
                 var descriptions = Temporaries.subMeshDescriptions;
-                Temporaries.keptSections = new NativeArray<bool>(math.max(1, sections.Length), defaultAllocator);
-                if (!hashes.IsCreated)
-                    return 0;
+                Temporaries.keptSections          = new NativeArray<bool>(math.max(1, sections.Length), defaultAllocator);
+                Temporaries.sectionLightmapHashes = new NativeArray<uint>(math.max(1, sections.Length), defaultAllocator);
                 var seen   = new NativeParallelHashSet<RenderMeshKey>(math.max(1, sections.Length), Allocator.Temp);
                 var buffer = new UnsafeAppendBuffer(256, 16, Allocator.Temp);
                 var kept   = 0;
@@ -2710,21 +2714,34 @@ namespace Chisel.Core
                 {
                     for (int i = 0; i < sections.Length; i++)
                     {
-                        var section = sections[i];
-                        if (!GatherSurfacesJob.OneMeshPerMaterial(section.meshQuery) || section.endIndex - section.startIndex != 1)
+                        var section  = sections[i];
+                        var collider = section.meshQuery.LayerParameterIndex == SurfaceParameterIndex.PhysicsMaterial;
+                        var render   = section.meshQuery.LayerParameterIndex == SurfaceParameterIndex.RenderMaterial;
+                        if (render)
+                            Temporaries.sectionLightmapHashes[i] = LightmapHash(section, ref buffer);
+                        if (!hashes.IsCreated ||
+                            !(collider || GatherSurfacesJob.OneMeshPerMaterial(section.meshQuery)) ||
+                            (render && section.endIndex - section.startIndex != 1))
                             continue;
+                        // a collider's section is the one description it starts at
                         var description = descriptions[section.startIndex];
                         buffer.Reset();
-                        buffer.Add(description.geometryHashValue);
-                        buffer.Add(description.surfaceHashValue);
-                        buffer.Add(description.vertexCount);
-                        buffer.Add(description.indexCount);
-                        buffer.Add(lightmapUVSettings);
+                        if (render)
+                        {
+                            buffer.Add(description.geometryHashValue);
+                            buffer.Add(description.surfaceHashValue);
+                            buffer.Add(description.vertexCount);
+                            buffer.Add(description.indexCount);
+                            buffer.Add(lightmapUVSettings);
+                        }
                         var surfaces = Temporaries.subMeshSurfaces[description.meshQueryIndex];
                         for (int s = description.surfacesOffset; s < description.surfacesOffset + description.surfacesCount && s < surfaces.Length; s++)
                         {
                             buffer.Add(surfaces[s].brushNodeID);
                             buffer.Add(surfaces[s].surfaceIndex);
+                            // a collider is the shape as the weld left it, before any hotspot cut
+                            if (collider && surfaces[s].brushRenderBuffer.IsCreated)
+                                buffer.Add(surfaces[s].brushRenderBuffer.Value.surfaces[surfaces[s].surfaceIndex].shapeHashValue);
                         }
                         var hash = xxHash3.Hash128(buffer.Ptr, buffer.Length);
                         var key  = new RenderMeshKey { query = (int)section.meshQuery.LayerQuery, surfaceParameter = description.surfaceParameter };
@@ -2737,12 +2754,15 @@ namespace Chisel.Core
                         }
                         hashes[key] = hash;
                     }
-                    // the meshes this update does not have any more
-                    using var keys = hashes.GetKeyArray(Allocator.Temp);
-                    for (int k = 0; k < keys.Length; k++)
+                    if (hashes.IsCreated)
                     {
-                        if (!seen.Contains(keys[k]))
-                            hashes.Remove(keys[k]);
+                        // the meshes this update does not have any more
+                        using var keys = hashes.GetKeyArray(Allocator.Temp);
+                        for (int k = 0; k < keys.Length; k++)
+                        {
+                            if (!seen.Contains(keys[k]))
+                                hashes.Remove(keys[k]);
+                        }
                     }
                     return kept;
                 }
@@ -2751,6 +2771,31 @@ namespace Chisel.Core
                     buffer.Dispose();
                     seen.Dispose();
                 }
+            }
+
+            // What a render mesh's lightmap layout is made from (ChiselOutputRenderable): each surface's chart, which the
+            // CSG made before any hotspot cut, and the layout settings
+            unsafe uint LightmapHash(SubMeshSection section, ref UnsafeAppendBuffer buffer)
+            {
+                buffer.Reset();
+                buffer.Add(lightmapUVSettings);
+                for (int d = section.startIndex; d < section.endIndex; d++)
+                {
+                    var description = Temporaries.subMeshDescriptions[d];
+                    var surfaces    = Temporaries.subMeshSurfaces[description.meshQueryIndex];
+                    for (int s = description.surfacesOffset; s < description.surfacesOffset + description.surfacesCount && s < surfaces.Length; s++)
+                    {
+                        if (!surfaces[s].brushRenderBuffer.IsCreated)
+                            continue;
+                        ref var surface = ref surfaces[s].brushRenderBuffer.Value.surfaces[surfaces[s].surfaceIndex];
+                        var drawn = surface.indices.Length > 0 && surface.renderVertices.Length > 0;
+                        buffer.Add(surface.lightmapChart);
+                        buffer.Add(drawn ? (int)LightmapUVLayout.ModeOf(surface.outputFlags) : -1);
+                        buffer.Add(surface.shapeHashValue);
+                        buffer.Add(surfaces[s].surfaceIndex);
+                    }
+                }
+                return xxHash3.Hash64(buffer.Ptr, buffer.Length).x;
             }
 
             // The meshes of this update, once its sections are known: one per section, so as many are allocated as are used
@@ -2791,6 +2836,7 @@ namespace Chisel.Core
                         subMeshSections  = Temporaries.vertexBufferContents.subMeshSections,
                         meshDatas        = Temporaries.meshDatas,
                         keptSections     = Temporaries.keptSections,
+                        sectionLightmapHashes = Temporaries.sectionLightmapHashes,
 
                         // Write
                         meshes           = Temporaries.vertexBufferContents.meshes,
@@ -2800,6 +2846,7 @@ namespace Chisel.Core
 						meshUpdatesRenderable         = Temporaries.meshUpdatesRenderables,
 						meshUpdatesDebugVisualization = Temporaries.meshUpdatesDebugVisualizations,
 						meshUpdatesKept               = Temporaries.meshUpdatesKept,
+						meshUpdatesKeptColliders      = Temporaries.meshUpdatesKeptColliders,
                     };
                     assignMeshesJob.Schedule(runInParallel,
                         JobHandles.Read(
@@ -3276,8 +3323,11 @@ namespace Chisel.Core
                 lastJobHandle.AddDependency(Temporaries.meshUpdatesDebugVisualizations.SafeDispose(JobHandles[JobHandleType.debugHelperMeshesJobHandle].readWriteBarrier));
                 lastJobHandle.AddDependency(Temporaries.meshUpdatesRenderables  .SafeDispose(JobHandles[JobHandleType.renderMeshesJobHandle].readWriteBarrier));
                 lastJobHandle.AddDependency(Temporaries.meshUpdatesKept         .SafeDispose(JobHandles[JobHandleType.renderMeshesJobHandle].readWriteBarrier));
+                lastJobHandle.AddDependency(Temporaries.meshUpdatesKeptColliders.SafeDispose(JobHandles[JobHandleType.renderMeshesJobHandle].readWriteBarrier));
                 if (Temporaries.keptSections.IsCreated)
                     lastJobHandle.AddDependency(Temporaries.keptSections        .SafeDispose(JobHandles[JobHandleType.renderMeshesJobHandle].readWriteBarrier));
+                if (Temporaries.sectionLightmapHashes.IsCreated)
+                    lastJobHandle.AddDependency(Temporaries.sectionLightmapHashes.SafeDispose(JobHandles[JobHandleType.renderMeshesJobHandle].readWriteBarrier));
                 lastJobHandle.AddDependency(Temporaries.meshDatas               .SafeDispose(JobHandles[JobHandleType.meshDatasJobHandle].readWriteBarrier));                
                 lastJobHandle.AddDependency(Temporaries.subMeshDescriptions     .SafeDispose(JobHandles[JobHandleType.subMeshDescriptionsJobHandle].readWriteBarrier));
                 

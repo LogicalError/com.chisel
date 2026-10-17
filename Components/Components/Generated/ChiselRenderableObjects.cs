@@ -16,6 +16,8 @@ namespace Chisel.Components
         public ChiselRenderObjects  instance;
         public Material             materialOverride;
         public bool                 meshIsModified;
+        // the lightmap layout changed: its baked lightmap is no longer valid
+        public bool                 lightmapIsModified;
         public ChiselModelComponent model;
 	}
     
@@ -77,6 +79,7 @@ namespace Chisel.Components
         
         public uint             geometryHashValue;
         public uint             surfaceHashValue;
+        public uint             lightmapHashValue;
 
         public bool             debugVisualizationRenderer;
 
@@ -261,7 +264,7 @@ namespace Chisel.Components
 		}
 #endif
 
-		void UpdateSettings(ChiselModelComponent model, GameObjectState state, bool meshIsModified)
+		void UpdateSettings(ChiselModelComponent model, GameObjectState state, bool lightmapIsModified)
         {
             ApplyShadowSettings(model.RenderSettings);
 #if UNITY_EDITOR
@@ -271,7 +274,7 @@ namespace Chisel.Components
             Profiler.EndSample();
 
 			// A lightmapped model's lightmap no longer fits a changed mesh; a model lit by light probes has none
-			if (meshIsModified && ChiselLightmapUVManager.IsLightmapped(model, state.staticFlags))
+			if (lightmapIsModified && ChiselLightmapUVManager.IsLightmapped(model, state.staticFlags))
             {
                 // Setting the sharedMesh to ensure the meshFilter knows it needs to be updated
                 Profiler.BeginSample("OverrideMesh");
@@ -713,6 +716,10 @@ namespace Chisel.Components
 				}
                 instance.geometryHashValue = geometryHashValue;
 				instance.surfaceHashValue = surfaceHashValue;
+                // a hotspot change redraws the mesh without moving its lightmap
+                objectUpdate.lightmapIsModified = (instance.lightmapHashValue != meshUpdate.lightmapHashValue) ||
+                                                  (objectUpdate.meshIsModified && meshUpdate.lightmapHashValue == 0);
+                instance.lightmapHashValue = meshUpdate.lightmapHashValue;
 #if UNITY_EDITOR
                 // Geometry re-uploaded => the selection and partial meshes mirroring it must be rebuilt too.
                 if (objectUpdate.meshIsModified)
@@ -730,7 +737,7 @@ namespace Chisel.Components
                 if (instance.meshRenderer.enabled != expectedEnabled)
                     instance.meshRenderer.enabled = expectedEnabled;
 
-                instance.UpdateSettings(objectUpdate.model, gameObjectState, objectUpdate.meshIsModified);
+                instance.UpdateSettings(objectUpdate.model, gameObjectState, objectUpdate.lightmapIsModified);
 			}
             Profiler.EndSample();
         }

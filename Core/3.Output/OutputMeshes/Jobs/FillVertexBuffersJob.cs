@@ -26,6 +26,8 @@ namespace Chisel.Core
         public ulong objectIndex;
         // a render mesh's material (each material is a mesh of its own)
         public ulong surfaceParameter;
+        // what a render mesh's lightmap layout is made from: its baked lightmap stays valid while this does
+        public uint  lightmapHashValue;
         public ChiselMeshType type;
         public SubMeshSection subMeshSection;
 	}
@@ -60,6 +62,7 @@ namespace Chisel.Core
         [NoAlias, ReadOnly] public NativeList<Mesh.MeshData>  meshDatas;
         // the sections whose render mesh is the same as last time (no mesh is filled for them)
         [NoAlias, ReadOnly] public NativeArray<bool> keptSections;
+        [NoAlias, ReadOnly] public NativeArray<uint> sectionLightmapHashes;
         
 		// Write
 		[NoAlias, WriteOnly] public NativeList<Mesh.MeshData> meshes;
@@ -69,6 +72,7 @@ namespace Chisel.Core
         [NoAlias] public NativeList<ChiselMeshUpdate> meshUpdatesColliders;
         [NoAlias] public NativeList<ChiselMeshUpdate> meshUpdatesDebugVisualization;
         [NoAlias] public NativeList<ChiselMeshUpdate> meshUpdatesKept;
+        [NoAlias] public NativeList<ChiselMeshUpdate> meshUpdatesKeptColliders;
 
 
         [BurstDiscard]
@@ -146,6 +150,7 @@ namespace Chisel.Core
                             meshIndex        = meshIndex,
                             objectIndex      = (ulong)renderIndex,
                             surfaceParameter = GatherSurfacesJob.OneMeshPerMaterial(subMeshSection.meshQuery) ? meshDescriptions[subMeshSection.startIndex].surfaceParameter : 0,
+                            lightmapHashValue = sectionLightmapHashes.IsCreated && i < sectionLightmapHashes.Length ? sectionLightmapHashes[i] : 0,
                             type             = ChiselMeshType.Render,
 						    subMeshSection   = subMeshSection
                         };
@@ -172,6 +177,19 @@ namespace Chisel.Core
                         continue;
 
                     var surfaceParameter = meshDescriptions[subMeshSection.startIndex].surfaceParameter;
+                    if (keptSections.IsCreated && i < keptSections.Length && keptSections[i])
+                    {
+                        meshUpdatesKeptColliders.Add(new ChiselMeshUpdate
+                        {
+                            contentsIndex  = i,
+                            colliderIndex  = -1,
+                            meshIndex      = -1,
+                            objectIndex    = surfaceParameter,
+                            type           = ChiselMeshType.Collider,
+                            subMeshSection = subMeshSection
+                        });
+                        continue;
+                    }
                     var meshUpdate = new ChiselMeshUpdate
                     {
                         contentsIndex  = i,

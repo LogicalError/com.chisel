@@ -148,12 +148,18 @@ namespace Chisel.Components
         {
             if (DeferBaking)
             {
-                // Only the most recent state of a model matters; an earlier deferred bake for it is stale.
+                // The colliders of every update the bake stands for: an update bakes only the colliders it changed
                 for (int i = 0; i < s_DeferredBakes.Count; i++)
                 {
                     if (s_DeferredBakes[i].model != model)
                         continue;
-                    s_DeferredBakes[i] = new DeferredBake { model = model, colliders = colliders };
+                    var merged = new System.Collections.Generic.List<ChiselColliderObjects>(s_DeferredBakes[i].colliders);
+                    foreach (var collider in colliders)
+                    {
+                        if (!merged.Contains(collider))
+                            merged.Add(collider);
+                    }
+                    s_DeferredBakes[i] = new DeferredBake { model = model, colliders = merged.ToArray() };
                     return;
                 }
                 s_DeferredBakes.Add(new DeferredBake { model = model, colliders = colliders });

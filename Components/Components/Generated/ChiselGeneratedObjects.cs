@@ -641,6 +641,30 @@ namespace Chisel.Components
                 Profiler.EndSample();
 
 
+                // a kept collider keeps its mesh and its bake; one that has gone missing builds the model again
+                Profiler.BeginSample("Kept.Colliders");
+                var keptColliders = ListPool<ChiselColliderObjects>.Get();
+                if (meshUpdates.meshUpdatesKeptColliders.IsCreated)
+                {
+                    foreach (var keptUpdate in meshUpdates.meshUpdatesKeptColliders)
+                    {
+                        var found = -1;
+                        for (int j = 0; j < colliders.Length && found < 0; j++)
+                        {
+                            if (colliders[j] != null && colliders[j].surfaceParameter == keptUpdate.objectIndex && colliders[j].IsValid())
+                                found = j;
+                        }
+                        if (found < 0)
+                        {
+                            ChiselNodeHierarchyManager.RebuildTreeNodes(model);
+                            continue;
+                        }
+                        keptColliders.Add(colliders[found]);
+                        colliders[found] = null;
+                    }
+                }
+                Profiler.EndSample();
+
                 Profiler.BeginSample("CleanUp.Colliders");
                 for (int j = 0; j < colliders.Length; j++)
                 {
@@ -650,10 +674,15 @@ namespace Chisel.Components
                 Profiler.EndSample();
 
                 Profiler.BeginSample("Assign.Colliders");
-                if (colliders.Length != colliderCount)
-                    colliders = new ChiselColliderObjects[colliderCount];
+                var changedColliders = new ChiselColliderObjects[colliderCount];
+                for (int i = 0; i < colliderCount; i++)
+                    changedColliders[i] = colliderObjects[i];
+                colliders = new ChiselColliderObjects[colliderCount + keptColliders.Count];
                 for (int i = 0; i < colliderCount; i++)
                     colliders[i] = colliderObjects[i];
+                for (int i = 0; i < keptColliders.Count; i++)
+                    colliders[colliderCount + i] = keptColliders[i];
+                ListPool<ChiselColliderObjects>.Release(keptColliders);
                 Profiler.EndSample();
 
                 Profiler.BeginSample("Renderers.Update");
@@ -739,12 +768,13 @@ namespace Chisel.Components
                 Profiler.BeginSample("Mesh.UpdateBounds");
                 ChiselRenderObjects.UpdateBounds(renderObjectUpdates);
                 // TODO: user meshDataArray data to determine the bounds and set it directly
-                for (int i = 0; i < colliders.Length; i++)
-                    colliders[i].sharedMesh.RecalculateBounds();
+                for (int i = 0; i < changedColliders.Length; i++)
+                    changedColliders[i].sharedMesh.RecalculateBounds();
                 Profiler.EndSample();
 
                 Profiler.BeginSample("Schedule Collider bake");
-                ChiselColliderObjects.ScheduleColliderBake(model, this.colliders);
+                if (changedColliders.Length > 0)
+                    ChiselColliderObjects.ScheduleColliderBake(model, changedColliders);
                 Profiler.EndSample();
 
                 this.needVisibilityMeshUpdate = true;

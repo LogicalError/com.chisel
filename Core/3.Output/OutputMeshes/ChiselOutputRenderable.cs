@@ -16,6 +16,8 @@ namespace Chisel.Core
 		[ReadOnly] public NativeList<ChiselMeshUpdate>  meshUpdatesDebugVisualizations;
 		// The render meshes that are the same as last time: their renderers keep what they have
 		[ReadOnly] public NativeList<ChiselMeshUpdate>  meshUpdatesKept;
+		// The same for the colliders: they keep their mesh and their bake
+		[ReadOnly] public NativeList<ChiselMeshUpdate>  meshUpdatesKeptColliders;
         
 		public Mesh.MeshDataArray meshDataArray;
     }
@@ -132,7 +134,7 @@ namespace Chisel.Core
                     {
                         rect = surface.lightmapChart,
                         mode = drawn ? LightmapUVLayout.ModeOf(surface.outputFlags) : LightmapChartMode.None,
-                        key  = ((ulong)surface.geometryHashValue << 32) | surface.surfaceHashValue
+                        key  = ((ulong)surface.shapeHashValue << 32) | (uint)chartSurface.surfaceIndex
                     };
                 }
             }

@@ -455,7 +455,9 @@ namespace Chisel.Core
                         continue;
                     }
                     to.Store(builder, indices, collider, select, render);
-                    // the collider keeps what the weld left, uncut
+                    // the collider and the lightmap keep what the weld left, uncut
+                    to.shapeHashValue = from.shapeHashValue;
+                    to.lightmapChart  = from.lightmapChart;
                     builder.Construct(ref to.physicsIndices,  ref from.indices);
                     builder.Construct(ref to.physicsVertices, ref from.colliderVertices);
                     to.CopySections(builder, ref from);
@@ -570,6 +572,8 @@ namespace Chisel.Core
             } else
             {
                 to.Store(builder, indices, collider, select, render);
+                to.shapeHashValue = from.shapeHashValue;
+                to.lightmapChart  = from.lightmapChart;
                 builder.Construct(ref to.physicsIndices,  ref from.indices);
                 builder.Construct(ref to.physicsVertices, ref from.colliderVertices);
                 to.CopySections(builder, ref from);

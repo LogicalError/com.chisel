@@ -25,6 +25,9 @@ namespace Chisel.Core
 
         public uint   geometryHashValue;
         public uint   surfaceHashValue;
+        // The geometry as the CSG and the weld made it, before a hotspot cut (geometryHashValue when it is not cut): what
+        // the collider and the lightmap layout follow
+        public uint   shapeHashValue;
 
         public MinMaxAABB aabb;  
         // The rectangle the surface's lightmap coordinates (RenderVertex.uv1) span in its plane: the lowest in xy, the highest in zw
@@ -69,6 +72,7 @@ namespace Chisel.Core
 			indexCount        = from.indexCount;
 			geometryHashValue = from.geometryHashValue;
 			surfaceHashValue  = from.surfaceHashValue;
+			shapeHashValue    = from.shapeHashValue;
 			aabb              = from.aabb;
 			lightmapChart     = from.lightmapChart;
 			builder.Construct(ref indices,          ref from.indices);
@@ -251,6 +255,7 @@ namespace Chisel.Core
 			this.surfaceHashValue = surfaceHash;
 			this.lightmapChart = (renderVertices.Length > 0) ? new float4(chartMin, chartMax) : float4.zero;
 			this.geometryHashValue = geometryHashValue;
+			this.shapeHashValue    = geometryHashValue;
 
 			this.aabb = colliderVertices.GetMinMax();
 

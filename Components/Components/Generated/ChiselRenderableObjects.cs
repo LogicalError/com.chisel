@@ -406,14 +406,16 @@ namespace Chisel.Components
             Profiler.EndSample();
         }
 
-        // Only when the selection ids changed: an edit that doesn't add, remove or rebuild a brush keeps them
+        // Only when the selection ids changed: an edit that doesn't add, remove or rebuild a brush keeps them (the owners
+        // follow from the descriptions alone, not from the triangles)
         void StoreSelectionOwners()
         {
             var descriptions = triangleBrushes.selectionIndexDescriptions;
-            if (selectionOwnersHash == triangleBrushes.hashCode &&
+            var hash = DescriptionsHash(descriptions);
+            if (selectionOwnersHash == hash &&
                 selectionOwnerIndices.Length == descriptions.Length)
                 return;
-            selectionOwnersHash = triangleBrushes.hashCode;
+            selectionOwnersHash = hash;
 
             var count         = descriptions.Length;
             var ownerIndices  = new int[count];
@@ -423,27 +425,37 @@ namespace Chisel.Components
             var indexOfOwner  = new Dictionary<ChiselGeneratorComponent, int>();
             var entityIndices = new List<int>();
             var entities      = new List<UnityEngine.Object>();
-            var brushOrders   = new Dictionary<ChiselGeneratorComponent, List<CompactNodeID>>();
+            var brushOrders   = new Dictionary<ChiselGeneratorComponent, Dictionary<CompactNodeID, int>>();
+            var ownerOfEntity = new Dictionary<ulong, ChiselGeneratorComponent>();
+            // a brush's surfaces have one description each: each brush is looked up once
+            var known         = new Dictionary<CompactNodeID, (ulong entity, int owner, int brush)>();
             for (int s = 0; s < count; s++)
             {
                 var description = descriptions[s];
-                var brushEntity = BrushEntityID(description.brushNodeID);
-                var owner       = Resources.EntityIdToObject(UnityEngine.EntityId.FromULong(brushEntity)) as ChiselGeneratorComponent;
-                if (owner == null)
+                if (!known.TryGetValue(description.brushNodeID, out var brushInfo))
                 {
-                    ownerIndices[s] = -1;
-                    brushIndices[s] = -1;
-                } else
-                {
-                    if (!indexOfOwner.TryGetValue(owner, out var ownerIndex))
+                    var entity = BrushEntityID(description.brushNodeID);
+                    if (!ownerOfEntity.TryGetValue(entity, out var owner))
                     {
-                        ownerIndex = owners.Count;
-                        owners.Add(owner);
-                        indexOfOwner.Add(owner, ownerIndex);
+                        owner = Resources.EntityIdToObject(UnityEngine.EntityId.FromULong(entity)) as ChiselGeneratorComponent;
+                        ownerOfEntity.Add(entity, owner);
                     }
-                    ownerIndices[s] = ownerIndex;
-                    brushIndices[s] = BrushesOf(owner, brushOrders).IndexOf(description.brushNodeID);
+                    brushInfo = (entity, -1, -1);
+                    if (owner != null)
+                    {
+                        if (!indexOfOwner.TryGetValue(owner, out var ownerIndex))
+                        {
+                            ownerIndex = owners.Count;
+                            owners.Add(owner);
+                            indexOfOwner.Add(owner, ownerIndex);
+                        }
+                        brushInfo = (entity, ownerIndex, BrushIndexIn(owner, description.brushNodeID, brushOrders));
+                    }
+                    known.Add(description.brushNodeID, brushInfo);
                 }
+                var brushEntity = brushInfo.entity;
+                ownerIndices[s] = brushInfo.owner;
+                brushIndices[s] = brushInfo.owner < 0 ? -1 : brushInfo.brush;
                 surfaces[s] = description.surfaceIndex;
                 if (description.entityID != brushEntity)
                 {
@@ -457,6 +469,37 @@ namespace Chisel.Components
             selectionSurfaces      = surfaces;
             selectionEntityIndices = entityIndices.ToArray();
             selectionEntities      = entities.ToArray();
+        }
+
+        // Where a brush is among the brushes its generator makes (-1 when it is not one of them)
+        static int BrushIndexIn(ChiselGeneratorComponent generator, CompactNodeID brush, Dictionary<ChiselGeneratorComponent, Dictionary<CompactNodeID, int>> brushOrders)
+        {
+            // most generators make one brush
+            var top = generator.TopTreeNode;
+            if (top.Valid && top.Type == CSGNodeType.Brush)
+                return CompactHierarchyManager.GetCompactNodeID(top) == brush ? 0 : -1;
+            if (!brushOrders.TryGetValue(generator, out var indices))
+            {
+                var brushes = BrushesOf(generator, new Dictionary<ChiselGeneratorComponent, List<CompactNodeID>>());
+                indices = new Dictionary<CompactNodeID, int>(brushes.Count);
+                for (int i = 0; i < brushes.Count; i++)
+                    indices.TryAdd(brushes[i], i);
+                brushOrders.Add(generator, indices);
+            }
+            return indices.TryGetValue(brush, out var index) ? index : -1;
+        }
+
+        static int DescriptionsHash(SelectionDescription[] descriptions)
+        {
+            if (descriptions == null)
+                return 0;
+            var hash = 0u;
+            for (int i = 0; i < descriptions.Length; i++)
+            {
+                var d = descriptions[i];
+                hash = math.hash(new uint4(hash, (uint)d.brushNodeID.GetHashCode(), (uint)d.surfaceIndex, (uint)d.entityID ^ (uint)(d.entityID >> 32)));
+            }
+            return (int)hash;
         }
 
         // The brushes a generator makes, in the order RestoreSelection finds them in again
@@ -571,7 +614,7 @@ namespace Chisel.Components
             triangleBrushes.selectionIndexDescriptions = descriptions;
             triangleBrushes.perTriangleNodeIDLookup    = brushNodeIDs;
             triangleBrushes.validTriangleCount         = triangleCount;
-            selectionOwnersHash = triangleBrushes.hashCode;
+            selectionOwnersHash = DescriptionsHash(descriptions);
 #if UNITY_EDITOR
             selectionMeshDirty  = true;
             partialMeshDirty    = true;

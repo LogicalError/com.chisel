@@ -950,6 +950,7 @@ namespace Chisel.Components
 				model.generated.inputHash          = settled ? GetInputHash(model) : default;
 				model.generated.componentInputHash = settled ? GetComponentInputHash(model) : default;
 			}
+			ChiselRenderObjects.StorePendingSelectionOwners();
 		}
 
 		[UnityEditor.InitializeOnLoadMethod]

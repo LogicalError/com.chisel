@@ -401,7 +401,7 @@ namespace Chisel.Components
                 if (subMeshTriangleLookups.IsCreated)
                 {
                     subMeshTriangleLookups.Value.CopyTo(instance.triangleBrushes);
-                    instance.StoreSelectionOwners();
+                    instance.SelectionOwnersChanged();
                 }
 #if UNITY_EDITOR
                 instance.selectionMeshDirty = true;
@@ -410,6 +410,76 @@ namespace Chisel.Components
             }
             Profiler.EndSample();
         }
+
+#if UNITY_EDITOR
+        // The owners are only read once the scene is loaded again, so an edit leaves them for later: they are stored
+        // before anything is saved (ChiselModelManager.StoreInputHashes) or reloaded, or once the edits stop. Weakly
+        // held, so a destroyed model's renderables don't stay loaded.
+        static readonly List<WeakReference<ChiselRenderObjects>> s_PendingOwners = new();
+        static double s_LastOwnersChange;
+        const double kOwnersIdleSeconds = 0.5;
+        [NonSerialized] bool selectionOwnersPending;
+
+        void SelectionOwnersChanged()
+        {
+            s_LastOwnersChange = UnityEditor.EditorApplication.timeSinceStartup;
+            if (selectionOwnersPending)
+                return;
+            selectionOwnersPending = true;
+            s_PendingOwners.Add(new WeakReference<ChiselRenderObjects>(this));
+        }
+
+        public static void StorePendingSelectionOwners()
+        {
+            if (s_PendingOwners.Count == 0)
+                return;
+            var pending = s_PendingOwners.ToArray();
+            s_PendingOwners.Clear();
+            foreach (var reference in pending)
+            {
+                if (reference.TryGetTarget(out var renderable))
+                    renderable.StorePendingOwners();
+            }
+        }
+
+        void StorePendingOwners()
+        {
+            if (!selectionOwnersPending)
+                return;
+            selectionOwnersPending = false;
+            if (!invalid && container)
+                StoreSelectionOwners();
+        }
+
+        [UnityEditor.InitializeOnLoadMethod]
+        static void RegisterPendingOwners()
+        {
+            UnityEditor.SceneManagement.PrefabStage.prefabSaving -= OnPrefabSaving;
+            UnityEditor.SceneManagement.PrefabStage.prefabSaving += OnPrefabSaving;
+            UnityEditor.AssemblyReloadEvents.beforeAssemblyReload -= StorePendingSelectionOwners;
+            UnityEditor.AssemblyReloadEvents.beforeAssemblyReload += StorePendingSelectionOwners;
+            UnityEditor.EditorApplication.playModeStateChanged -= OnPlayModeStateChanged;
+            UnityEditor.EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
+            UnityEditor.EditorApplication.update -= OnUpdate;
+            UnityEditor.EditorApplication.update += OnUpdate;
+        }
+
+        static void OnPrefabSaving(GameObject prefab) => StorePendingSelectionOwners();
+        static void OnPlayModeStateChanged(UnityEditor.PlayModeStateChange state)
+        {
+            if (state == UnityEditor.PlayModeStateChange.ExitingEditMode)
+                StorePendingSelectionOwners();
+        }
+
+        static void OnUpdate()
+        {
+            if (s_PendingOwners.Count > 0 &&
+                UnityEditor.EditorApplication.timeSinceStartup - s_LastOwnersChange > kOwnersIdleSeconds)
+                StorePendingSelectionOwners();
+        }
+#else
+        void SelectionOwnersChanged() => StoreSelectionOwners();
+#endif
 
         // Only when the selection ids changed: an edit that doesn't add, remove or rebuild a brush keeps them (the owners
         // follow from the descriptions alone, not from the triangles)
@@ -534,7 +604,7 @@ namespace Chisel.Components
 
         static ulong BrushEntityID(CompactNodeID brushNodeID)
         {
-            if (brushNodeID == CompactNodeID.Invalid)
+            if (brushNodeID == CompactNodeID.Invalid || !CompactHierarchyManager.IsValidCompactNodeID(brushNodeID))
                 return 0;
             ref var hierarchy = ref CompactHierarchyManager.GetHierarchy(brushNodeID);
             if (!hierarchy.IsValidCompactNodeID(brushNodeID))
@@ -568,6 +638,9 @@ namespace Chisel.Components
         {
             if (invalid || !sharedMesh)
                 return;
+#if UNITY_EDITOR
+            StorePendingOwners();
+#endif
 
             var count        = Math.Min(Math.Min(selectionOwnerIndices.Length, selectionBrushIndices.Length), selectionSurfaces.Length);
             var descriptions = new SelectionDescription[count];

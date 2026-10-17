@@ -14,6 +14,8 @@ namespace Chisel.Core
 		[ReadOnly] public NativeList<ChiselMeshUpdate>  meshUpdatesRenderables;
 		[ReadOnly] public NativeList<ChiselMeshUpdate>  meshUpdatesColliders;
 		[ReadOnly] public NativeList<ChiselMeshUpdate>  meshUpdatesDebugVisualizations;
+		// The render meshes that are the same as last time: their renderers keep what they have
+		[ReadOnly] public NativeList<ChiselMeshUpdate>  meshUpdatesKept;
         
 		public Mesh.MeshDataArray meshDataArray;
     }

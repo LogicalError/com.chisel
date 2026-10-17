@@ -471,6 +471,14 @@ namespace Chisel.Core
         // Write
         [NoAlias, WriteOnly] public NativeList<SubMeshSection>  subMeshSections;
             
+        // A query whose materials each get a mesh of their own: one that draws (a shadow-only one draws everything with
+        // one material)
+        internal static bool OneMeshPerMaterial(MeshQuery query)
+        {
+            return query.LayerParameterIndex == SurfaceParameterIndex.RenderMaterial &&
+                   (query.LayerQuery & SurfaceDestinationFlags.Renderable) != 0;
+        }
+
         public void Execute()
         {
             if (subMeshDescriptions.Length == 0)
@@ -491,8 +499,10 @@ namespace Chisel.Core
                         subMeshCount.meshQuery.LayerParameterIndex != SurfaceParameterIndex.RenderMaterial)
                         break;
 
+                    // a render query's materials each get a mesh of their own, so a mesh changes only with its material
                     var currQuery = subMeshCount.meshQuery;
-                    if (prevQuery == currQuery)
+                    if (descriptionIndex == startIndex ||
+                        (prevQuery == currQuery && !OneMeshPerMaterial(currQuery)))
                     {
                         continue;
                     }

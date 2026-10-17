@@ -55,6 +55,8 @@ namespace Chisel.Core
             public NativeParallelHashMap<CompactNodeID, HotspotCutEntry>        hotspotCutCache;
             // What each group of hotspot surfaces was matched with, by what it was made from (HotspotGroups.Match)
             public NativeParallelHashMap<uint4, GroupMatchEntry>               hotspotMatchCache;
+            // What each render mesh was last made from, by (query, material): a mesh made from the same is kept
+            public NativeParallelHashMap<RenderMeshKey, uint4>                 renderMeshHashes;
 
 			internal void Initialize()
             {
@@ -83,6 +85,7 @@ namespace Chisel.Core
 				collapseMoves               = new NativeList<float3x2>(4, Allocator.Persistent);
 				hotspotCutCache             = new NativeParallelHashMap<CompactNodeID, HotspotCutEntry>(16, Allocator.Persistent);
 				hotspotMatchCache           = new NativeParallelHashMap<uint4, GroupMatchEntry>(16, Allocator.Persistent);
+				renderMeshHashes            = new NativeParallelHashMap<RenderMeshKey, uint4>(16, Allocator.Persistent);
 				decalTargets                = new NativeList<ChiselDecalTarget>(16, Allocator.Persistent);
 				decalVolumeTargets          = new NativeList<ChiselDecalTarget>(16, Allocator.Persistent);
 				changedDecalBounds          = new NativeList<MinMaxAABB>(16, Allocator.Persistent);
@@ -296,6 +299,8 @@ namespace Chisel.Core
                     hotspotMatchCache.Dispose();
                 }
                 hotspotMatchCache = default;
+                if (renderMeshHashes.IsCreated) renderMeshHashes.Dispose();
+                renderMeshHashes = default;
                 decalInstances = default;
                 decalBounds = default;
                 decalVolumes = default;

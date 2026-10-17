@@ -127,18 +127,9 @@ namespace Chisel.Components
             Debug.Assert((int)SurfaceDestinationFlags.ShadowReceiving == 4);
             Debug.Assert((int)SurfaceDestinationFlags.RenderShadowReceiveAndCasting == (1|2|4));
 
-            var renderables = new ChiselRenderObjects[kGeneratedMeshRenderCount];
-            for (int i = 0; i < kGeneratedMeshRenderCount; i++)
-                renderables[i] = new() { invalid = true };
-            var meshRenderers = new MeshRenderer[kGeneratedMeshRendererCount];
-            for (int r = 0; r < kGeneratedMeshRendererCount; r++)
-            {
-                var index = kGeneratedMeshRendererIndices[r];
-                Debug.Assert(RendererQuery(index).RendererIndex() == index);
-                renderables[index] = ChiselRenderObjects.Create(kGeneratedMeshRendererNames[index], containerTransform, gameObjectState, RendererQuery(index));
-                renderables[index].invalid = false;
-                meshRenderers[r] = renderables[index].meshRenderer;
-            }
+            // the renderers come with the materials that are drawn (FindRenderables)
+            var renderables   = Array.Empty<ChiselRenderObjects>();
+            var meshRenderers = Array.Empty<MeshRenderer>();
 
             var debugVisualizationRenderables = new ChiselRenderObjects[kVisualizationModeCount];
             var debugMeshRenderers = new MeshRenderer[kVisualizationModeCount];
@@ -270,9 +261,7 @@ namespace Chisel.Components
                 return false;
 
             if (renderables == null ||
-                renderables.Length != kGeneratedMeshRenderCount ||
-                meshRenderers == null ||
-                meshRenderers.Length != kGeneratedMeshRendererCount)
+                meshRenderers == null)
                 return false;
 
             if (debugVisualizationRenderables == null ||
@@ -282,25 +271,12 @@ namespace Chisel.Components
                 return false;
 
             // These queries are valid, and should never be null (We don't care about the other queries)
-            foreach (var index in kGeneratedMeshRendererIndices)
-            {
-                if (renderables[index] == null)
-                    return false;
-            }
-
-            // These queries are valid, and should never be null (We don't care about the other queries)
             for (int i = 0; i < kVisualizationModeCount;i++)
             { 
                 if (debugVisualizationRenderables[i] == null)
                     return false;
             }
             
-            for (int i = 0; i < renderables.Length; i++)
-            {
-                if (renderables[i] != null)
-                    renderables[i].invalid = Array.IndexOf(kGeneratedMeshRendererIndices, i) < 0;
-            }
-
             for (int i = 0; i < kVisualizationModeCount; i++)
                 debugVisualizationRenderables[i].invalid = false;
 
@@ -433,8 +409,97 @@ namespace Chisel.Components
 			return parent.name == kGeneratedContainerName;
 		}
 
-		// in between UpdateMeshes and FinishMeshUpdates our jobs should be force completed, so we can now upload our meshes to unity Meshes
+        // Empty meshes that take the mesh data no renderer used (Mesh.ApplyAndDisposeWritableMeshData wants a mesh for each)
+        static readonly System.Collections.Generic.List<Mesh> s_PaddingMeshes = new();
 
+        static Mesh PaddingMesh(int index)
+        {
+            while (s_PaddingMeshes.Count <= index)
+                s_PaddingMeshes.Add(null);
+            if (!s_PaddingMeshes[index])
+                s_PaddingMeshes[index] = new Mesh { name = "‹[generated-Padding]›", hideFlags = HideFlags.HideAndDontSave };
+            return s_PaddingMeshes[index];
+        }
+
+        // The renderers of this update's render meshes: the one drawing the same material for the same query again, a new
+        // one for a material that is new; the renderers of materials no longer drawn are destroyed. Each update's
+        // objectIndex becomes its renderer's place in renderables. A kept mesh's renderer stays as it is; when one is
+        // missing (its objects were deleted) the model is built again, its meshes all made anew.
+        void FindRenderables(ChiselModelComponent model, GameObjectState gameObjectState, ref ChiselMeshUpdates meshUpdates)
+        {
+            var existing = DictionaryPool<(SurfaceDestinationFlags, ulong), ChiselRenderObjects>.Get();
+            try
+            {
+                if (renderables != null)
+                {
+                    foreach (var renderable in renderables)
+                    {
+                        if (renderable == null || renderable.invalid || !renderable.IsValid())
+                        {
+                            renderable?.Destroy();
+                            continue;
+                        }
+                        if (!existing.TryAdd((renderable.query, renderable.surfaceParameter), renderable))
+                            renderable.Destroy();
+                    }
+                }
+                var containerTransform = generatedDataContainer.transform;
+                var keptCount = meshUpdates.meshUpdatesKept.IsCreated ? meshUpdates.meshUpdatesKept.Length : 0;
+                var found = new ChiselRenderObjects[meshUpdates.meshUpdatesRenderables.Length + keptCount];
+                var missing = false;
+                for (int k = 0; k < keptCount; k++)
+                {
+                    var kept  = meshUpdates.meshUpdatesKept[k];
+                    var query = RendererQuery((int)kept.objectIndex);
+                    if (!existing.Remove((query, kept.surfaceParameter), out var renderable) || !renderable.HasGeometry)
+                    {
+                        missing = true;
+                        renderable?.Destroy();
+                        renderable = null;
+                    }
+                    found[meshUpdates.meshUpdatesRenderables.Length + k] = renderable;
+                }
+                for (int i = 0; i < meshUpdates.meshUpdatesRenderables.Length; i++)
+                {
+                    var update = meshUpdates.meshUpdatesRenderables[i];
+                    var query  = RendererQuery((int)update.objectIndex);
+                    if (!existing.Remove((query, update.surfaceParameter), out var renderable))
+                    {
+                        renderable = ChiselRenderObjects.Create(RendererName((int)update.objectIndex, update.surfaceParameter), containerTransform, gameObjectState, query);
+                        renderable.surfaceParameter = update.surfaceParameter;
+                    }
+                    found[i] = renderable;
+                    update.objectIndex = (ulong)i;
+                    meshUpdates.meshUpdatesRenderables[i] = update;
+                }
+                foreach (var unused in existing.Values)
+                    unused.Destroy();
+                if (missing)
+                {
+                    found = Array.FindAll(found, renderable => renderable != null);
+                    ChiselNodeHierarchyManager.RebuildTreeNodes(model);
+                }
+                renderables   = found;
+                meshRenderers = new MeshRenderer[found.Length];
+                for (int i = 0; i < found.Length; i++)
+                    meshRenderers[i] = found[i].meshRenderer;
+            }
+            finally
+            {
+                DictionaryPool<(SurfaceDestinationFlags, ulong), ChiselRenderObjects>.Release(existing);
+            }
+        }
+
+        static string RendererName(int index, ulong surfaceParameter)
+        {
+            var name = (index >= 0 && index < kGeneratedMeshRendererNames.Length ? kGeneratedMeshRendererNames[index] : null) ?? "‹[generated]›";
+            if (surfaceParameter == 0)
+                return name;
+            var material = Resources.EntityIdToObject(UnityEngine.EntityId.FromULong(surfaceParameter)) as Material;
+            return material ? $"{name} {material.name}" : name;
+        }
+
+		// in between UpdateMeshes and FinishMeshUpdates our jobs should be force completed, so we can now upload our meshes to unity Meshes
 		public int FinishMeshUpdates(ChiselModelComponent model, 
                                      ChiselMeshUpdates meshUpdates, JobHandle dependencies)
 		{
@@ -462,6 +527,10 @@ namespace Chisel.Components
                 Debug.Assert((SurfaceParameterIndex.Parameter1 + 1) == SurfaceParameterIndex.Parameter2);
 
                 dependencies.Complete();
+
+                Profiler.BeginSample("FindRenderables");
+                FindRenderables(model, gameObjectState, ref meshUpdates);
+                Profiler.EndSample();
 
                 Debug.Assert(!meshUpdates.vertexBufferContents.meshDescriptions.IsCreated ||
                              meshUpdates.vertexBufferContents.meshDescriptions.Length == 0 ||
@@ -591,6 +660,12 @@ namespace Chisel.Components
                 ChiselRenderObjects.UpdateSettings(renderMeshUpdates, renderObjectUpdates, gameObjectStates, ref meshUpdates.vertexBufferContents);
                 Profiler.EndSample();
 
+                // the model's shadow settings reach the renderers whose meshes were kept too
+                Profiler.BeginSample("Renderers.ShadowSettings");
+                foreach (var renderable in renderables)
+                    renderable?.ApplyShadowSettings(model.RenderSettings);
+                Profiler.EndSample();
+
                 Debug.Assert(foundMeshes.Count <= meshUpdates.meshDataArray.Length);
 
                 var realMeshDataArraySize = meshUpdates.meshDataArray.Length;
@@ -600,32 +675,6 @@ namespace Chisel.Components
                     // TODO: figure out why the maximum meshDataArray.Length does not match the maximum used meshes?
 
                     int meshDataArrayOffset = foundMeshes.Count;
-                    for (int i = 0; i < renderables.Length; i++)
-                    {
-                        if (usedRenderMeshes.Contains(i))
-                            continue;
-
-                        var instance = renderables[i];
-                        if (instance.meshRenderer &&
-                            instance.meshRenderer.enabled)
-                            instance.meshRenderer.enabled = false;
-                        if (foundMeshes.Count < meshUpdates.meshDataArray.Length)
-                        {
-                            var sharedMesh = instance.sharedMesh;
-                            if (!sharedMesh || foundMeshes.Contains(sharedMesh))
-                                continue;
-
-                            instance.geometryHashValue = 0;
-							instance.surfaceHashValue = 0;
-
-							foundMeshes.Add(sharedMesh);
-                            var emptyMeshData = meshUpdates.meshDataArray[meshDataArrayOffset];
-                            emptyMeshData.SetIndexBufferParams(0, IndexFormat.UInt32);
-                            emptyMeshData.SetVertexBufferParams(0, VertexBufferContents.RenderDescriptors);
-                            emptyMeshData.subMeshCount = 0;
-                            meshDataArrayOffset++;
-                        }
-                    }
 
                     for (int i = 0; i < debugVisualizationRenderables.Length; i++)
                     {
@@ -649,6 +698,17 @@ namespace Chisel.Components
                             emptyMeshData.subMeshCount = 0;
                             meshDataArrayOffset++;
                         }
+                    }
+
+                    // the mesh data allocated for materials no renderer drew this time
+                    for (int pad = 0; foundMeshes.Count < meshUpdates.meshDataArray.Length; pad++)
+                    {
+                        foundMeshes.Add(PaddingMesh(pad));
+                        var emptyMeshData = meshUpdates.meshDataArray[meshDataArrayOffset];
+                        emptyMeshData.SetIndexBufferParams(0, IndexFormat.UInt32);
+                        emptyMeshData.SetVertexBufferParams(0, VertexBufferContents.RenderDescriptors);
+                        emptyMeshData.subMeshCount = 0;
+                        meshDataArrayOffset++;
                     }
                 }
 

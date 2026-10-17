@@ -24,10 +24,21 @@ namespace Chisel.Core
         public int colliderIndex;
         public int meshIndex;
         public ulong objectIndex;
+        // a render mesh's material (each material is a mesh of its own)
+        public ulong surfaceParameter;
         public ChiselMeshType type;
         public SubMeshSection subMeshSection;
 	}
     
+    // A render mesh of a tree: its query and its material
+    public struct RenderMeshKey : System.IEquatable<RenderMeshKey>
+    {
+        public int   query;
+        public ulong surfaceParameter;
+        public bool Equals(RenderMeshKey other) => query == other.query && surfaceParameter == other.surfaceParameter;
+        public override int GetHashCode() => (int)Unity.Mathematics.math.hash(new Unity.Mathematics.uint3((uint)query, (uint)surfaceParameter, (uint)(surfaceParameter >> 32)));
+    }
+
     [BurstCompile(CompileSynchronously = true)]
     public struct AssignMeshesJob : IJob
     {
@@ -47,6 +58,8 @@ namespace Chisel.Core
         [NoAlias, ReadOnly] public NativeList<GeneratedMeshDescription> meshDescriptions;
         [NoAlias, ReadOnly] public NativeList<SubMeshSection> subMeshSections;
         [NoAlias, ReadOnly] public NativeList<Mesh.MeshData>  meshDatas;
+        // the sections whose render mesh is the same as last time (no mesh is filled for them)
+        [NoAlias, ReadOnly] public NativeArray<bool> keptSections;
         
 		// Write
 		[NoAlias, WriteOnly] public NativeList<Mesh.MeshData> meshes;
@@ -55,6 +68,7 @@ namespace Chisel.Core
         [NoAlias] public NativeList<ChiselMeshUpdate> meshUpdatesRenderable;
         [NoAlias] public NativeList<ChiselMeshUpdate> meshUpdatesColliders;
         [NoAlias] public NativeList<ChiselMeshUpdate> meshUpdatesDebugVisualization;
+        [NoAlias] public NativeList<ChiselMeshUpdate> meshUpdatesKept;
 
 
         [BurstDiscard]
@@ -113,13 +127,27 @@ namespace Chisel.Core
                     if (subMeshSection.meshQuery.LayerParameterIndex == SurfaceParameterIndex.RenderMaterial)
                     {
                         var renderIndex = subMeshSection.meshQuery.LayerQuery.RendererIndex();
+                        if (keptSections.IsCreated && i < keptSections.Length && keptSections[i])
+                        {
+                            meshUpdatesKept.Add(new ChiselMeshUpdate
+                            {
+                                contentsIndex    = i,
+                                meshIndex        = -1,
+                                objectIndex      = (ulong)renderIndex,
+                                surfaceParameter = meshDescriptions[subMeshSection.startIndex].surfaceParameter,
+                                type             = ChiselMeshType.Render,
+                                subMeshSection   = subMeshSection
+                            });
+                            continue;
+                        }
                         var meshUpdate = new ChiselMeshUpdate
                         {
-                            contentsIndex  = i,
-                            meshIndex      = meshIndex,
-                            objectIndex    = (ulong)renderIndex,
-                            type           = ChiselMeshType.Render,
-						    subMeshSection = subMeshSection
+                            contentsIndex    = i,
+                            meshIndex        = meshIndex,
+                            objectIndex      = (ulong)renderIndex,
+                            surfaceParameter = GatherSurfacesJob.OneMeshPerMaterial(subMeshSection.meshQuery) ? meshDescriptions[subMeshSection.startIndex].surfaceParameter : 0,
+                            type             = ChiselMeshType.Render,
+						    subMeshSection   = subMeshSection
                         };
 
                         meshes.Add(meshDatas[meshIndex]);

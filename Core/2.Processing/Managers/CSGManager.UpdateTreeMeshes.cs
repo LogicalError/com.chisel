@@ -209,6 +209,8 @@ namespace Chisel.Core
             public bool          propagationRequested;
             // Set when RunMeshUpdateJobs left the meshes for the next propagation round to build.
             public bool          skipMeshGeneration;
+            // RunMeshUpdateJobs ran for this update (RunMeshCopyJobs follows)
+            public bool          ranMeshUpdate;
             public bool          subtractiveWorkflow;
             public float         normalSmoothingAngle;
             public LightmapUVSettings lightmapUVSettings;
@@ -299,6 +301,8 @@ namespace Chisel.Core
 
                 public NativeList<ChiselMeshUpdate>         meshUpdatesColliders;
                 public NativeList<ChiselMeshUpdate>         meshUpdatesRenderables;
+                public NativeList<ChiselMeshUpdate>         meshUpdatesKept;
+                public NativeArray<bool>                    keptSections;
                 public NativeList<ChiselMeshUpdate>         meshUpdatesDebugVisualizations;
 
                 public NativeList<BlobAssetReference<BasePolygonsBlob>>           basePolygonDisposeList;
@@ -626,6 +630,7 @@ namespace Chisel.Core
 
                 Temporaries.meshUpdatesColliders            = new NativeList<ChiselMeshUpdate>(defaultAllocator);
                 Temporaries.meshUpdatesRenderables          = new NativeList<ChiselMeshUpdate>(defaultAllocator);
+                Temporaries.meshUpdatesKept                 = new NativeList<ChiselMeshUpdate>(defaultAllocator);
                 Temporaries.meshUpdatesDebugVisualizations  = new NativeList<ChiselMeshUpdate>(defaultAllocator);
 
 
@@ -813,6 +818,7 @@ namespace Chisel.Core
                             treeUpdate.treeCompactNodeID = treeCompactNodeID;
                             treeUpdate.propagationRequested = false;
                             treeUpdate.skipMeshGeneration = false;
+                            treeUpdate.ranMeshUpdate = false;
                             treeUpdate.brushListChanged = false;
                             treeUpdateLength++;
                         }
@@ -890,8 +896,19 @@ namespace Chisel.Core
                                     treeUpdate.JobHandles.SeedResourceWriter(JobHandleType.compactHierarchyJobHandle, sharedCompactHierarchy);
 
                                     treeUpdate.RunMeshUpdateJobs();
+                                    treeUpdate.ranMeshUpdate = true;
 
                                     // Carry this tree's accumulated hierarchy access forward so the next tree depends on it.
+                                    sharedCompactHierarchy = treeUpdate.JobHandles[JobHandleType.compactHierarchyJobHandle].readWriteBarrier;
+                                }
+                                // then each tree's meshes, as soon as its own sections are known (the other trees' CSG keeps running)
+                                for (int t = treeUpdateLength - 1; t >= 0; t--)
+                                {
+                                    ref var treeUpdate = ref treeUpdates[t];
+                                    if (!treeUpdate.ranMeshUpdate)
+                                        continue;
+                                    treeUpdate.JobHandles.SeedResourceWriter(JobHandleType.compactHierarchyJobHandle, sharedCompactHierarchy);
+                                    treeUpdate.RunMeshCopyJobs();
                                     sharedCompactHierarchy = treeUpdate.JobHandles[JobHandleType.compactHierarchyJobHandle].readWriteBarrier;
                                 }
                             }
@@ -962,7 +979,8 @@ namespace Chisel.Core
 									    meshDataArray                   = treeUpdate.Temporaries.meshDataArray,
 									    meshUpdatesColliders            = treeUpdate.Temporaries.meshUpdatesColliders,
 									    meshUpdatesRenderables          = treeUpdate.Temporaries.meshUpdatesRenderables,
-									    meshUpdatesDebugVisualizations  = treeUpdate.Temporaries.meshUpdatesDebugVisualizations
+									    meshUpdatesDebugVisualizations  = treeUpdate.Temporaries.meshUpdatesDebugVisualizations,
+									    meshUpdatesKept                 = treeUpdate.Temporaries.meshUpdatesKept
                                     };
 								    var usedMeshCount = finishMeshUpdates(treeUpdate.tree, meshUpdates, treeUpdate.dependencies);
                                     treeUpdate.Temporaries.meshDataArray = default;
@@ -2394,7 +2412,8 @@ namespace Chisel.Core
                             JobHandleType.brushesTouchedByBrushCacheJobHandle,
                             JobHandleType.dataStream2JobHandle,
                             JobHandleType.meshQueriesJobHandle,
-                            JobHandleType.decalVolumesJobHandle),
+                            JobHandleType.decalVolumesJobHandle,
+                            JobHandleType.compactHierarchyJobHandle),   // entityIDLookup reads every hierarchy
                         JobHandles.Write(JobHandleType.brushRenderBufferCacheJobHandle));
 
 					NativeCollection.ScheduleDispose(runInParallel, ref dataStream2, currentJobHandle);
@@ -2671,32 +2690,90 @@ namespace Chisel.Core
 				#endregion
 
 
+                #endregion
+            }
+
+            // Marks the sections whose render mesh is made from the same as last time (Temporaries.keptSections) and
+            // remembers what each was made from; returns how many there are. Only a query's own material meshes are kept:
+            // the shadow-only, debug and collider meshes are always made again.
+            unsafe int FindKeptSections(NativeParallelHashMap<RenderMeshKey, uint4> hashes)
+            {
+                var sections     = Temporaries.vertexBufferContents.subMeshSections;
+                var descriptions = Temporaries.subMeshDescriptions;
+                Temporaries.keptSections = new NativeArray<bool>(math.max(1, sections.Length), defaultAllocator);
+                if (!hashes.IsCreated)
+                    return 0;
+                var seen   = new NativeParallelHashSet<RenderMeshKey>(math.max(1, sections.Length), Allocator.Temp);
+                var buffer = new UnsafeAppendBuffer(256, 16, Allocator.Temp);
+                var kept   = 0;
+                try
+                {
+                    for (int i = 0; i < sections.Length; i++)
+                    {
+                        var section = sections[i];
+                        if (!GatherSurfacesJob.OneMeshPerMaterial(section.meshQuery) || section.endIndex - section.startIndex != 1)
+                            continue;
+                        var description = descriptions[section.startIndex];
+                        buffer.Reset();
+                        buffer.Add(description.geometryHashValue);
+                        buffer.Add(description.surfaceHashValue);
+                        buffer.Add(description.vertexCount);
+                        buffer.Add(description.indexCount);
+                        buffer.Add(lightmapUVSettings);
+                        var surfaces = Temporaries.subMeshSurfaces[description.meshQueryIndex];
+                        for (int s = description.surfacesOffset; s < description.surfacesOffset + description.surfacesCount && s < surfaces.Length; s++)
+                        {
+                            buffer.Add(surfaces[s].brushNodeID);
+                            buffer.Add(surfaces[s].surfaceIndex);
+                        }
+                        var hash = xxHash3.Hash128(buffer.Ptr, buffer.Length);
+                        var key  = new RenderMeshKey { query = (int)section.meshQuery.LayerQuery, surfaceParameter = description.surfaceParameter };
+                        if (!seen.Add(key))
+                            continue;
+                        if (hashes.TryGetValue(key, out var last) && last.Equals(hash))
+                        {
+                            Temporaries.keptSections[i] = true;
+                            kept++;
+                        }
+                        hashes[key] = hash;
+                    }
+                    // the meshes this update does not have any more
+                    using var keys = hashes.GetKeyArray(Allocator.Temp);
+                    for (int k = 0; k < keys.Length; k++)
+                    {
+                        if (!seen.Contains(keys[k]))
+                            hashes.Remove(keys[k]);
+                    }
+                    return kept;
+                }
+                finally
+                {
+                    buffer.Dispose();
+                    seen.Dispose();
+                }
+            }
+
+            // The meshes of this update, once its sections are known: one per section, so as many are allocated as are used
+            public void RunMeshCopyJobs()
+            {
+                if (skipMeshGeneration)
+                    return;
+                var chiselLookupValues = ChiselTreeLookup.Value[this.tree];
+                ref var brushMeshBlobs = ref ChiselMeshLookup.Value.brushMeshBlobCache;
+
+                #region Store Results
 				// TODO: Make creation of different kinds of 'meshes' consistent
 				#region Create Meshes
 				using (kMesh_AllocateWritableMeshDataProfilerMarker.Auto())
                 {
-                    var meshAllocations = 0;
-                    for (int m = 0; m < Temporaries.meshQueries.Length; m++)
-                    {
-                        var meshQuery = Temporaries.meshQueries[m];
-                        var surfaceParameterIndex = (meshQuery.LayerParameterIndex >= SurfaceParameterIndex.Parameter1 &&
-                                                        meshQuery.LayerParameterIndex <= SurfaceParameterIndex.MaxParameterIndex) ?
-                                                        (int)meshQuery.LayerParameterIndex : 0;
-
-                        // Query uses Material
-                        if ((meshQuery.LayerQuery & SurfaceDestinationFlags.Renderable) != 0 && surfaceParameterIndex == 1)
-                        {
-                            // Each Material is stored as a submesh in the same mesh
-                            meshAllocations += 1;
-                        }
-                        // Query uses PhysicMaterial
-                        else if ((meshQuery.LayerQuery & SurfaceDestinationFlags.Collidable) != 0 && surfaceParameterIndex == 2)
-                        {
-                            // Each PhysicMaterial is stored in its own separate mesh
-                            meshAllocations += Temporaries.parameterCounts[SurfaceDestinationParameters.kColliderLayer];
-                        } else
-                            meshAllocations++;
-                    }
+                    // every section is a mesh of its own: a debug visualization, a render query's material (or a
+                    // shadow-only query) or a physics material
+                    JobHandles[JobHandleType.vertexBufferContents_subMeshSectionsJobHandle].writeBarrier.Complete();
+                    JobHandles[JobHandleType.subMeshDescriptionsJobHandle].writeBarrier.Complete();
+                    JobHandles[JobHandleType.subMeshSurfacesJobHandle].writeBarrier.Complete();
+                    // a render mesh made from the same as last time is kept as it is
+                    var keptCount = FindKeptSections(chiselLookupValues.renderMeshHashes);
+                    var meshAllocations = Temporaries.vertexBufferContents.subMeshSections.Length - keptCount;
 
                     Temporaries.meshDataArray = UnityEngine.Mesh.AllocateWritableMeshData(meshAllocations);
 
@@ -2713,6 +2790,7 @@ namespace Chisel.Core
                         meshDescriptions = Temporaries.vertexBufferContents.meshDescriptions,
                         subMeshSections  = Temporaries.vertexBufferContents.subMeshSections,
                         meshDatas        = Temporaries.meshDatas,
+                        keptSections     = Temporaries.keptSections,
 
                         // Write
                         meshes           = Temporaries.vertexBufferContents.meshes,
@@ -2721,6 +2799,7 @@ namespace Chisel.Core
 						meshUpdatesColliders          = Temporaries.meshUpdatesColliders,
 						meshUpdatesRenderable         = Temporaries.meshUpdatesRenderables,
 						meshUpdatesDebugVisualization = Temporaries.meshUpdatesDebugVisualizations,
+						meshUpdatesKept               = Temporaries.meshUpdatesKept,
                     };
                     assignMeshesJob.Schedule(runInParallel,
                         JobHandles.Read(
@@ -2864,7 +2943,8 @@ namespace Chisel.Core
                             JobHandleType.vertexBufferContents_subMeshSectionsJobHandle,
                             JobHandleType.subMeshDescriptionsJobHandle,
                             JobHandleType.subMeshSurfacesJobHandle,
-                            JobHandleType.renderMeshesJobHandle),
+                            JobHandleType.renderMeshesJobHandle,
+                            JobHandleType.compactHierarchyJobHandle),   // entityIDLookup reads every hierarchy
                         JobHandles.Write(JobHandleType.vertexBufferContents_triangleBrushIndicesJobHandle));
                     
 					    var renderTriangleBrushIndicesJob2 = new FindTriangleBrushIndicesJob
@@ -2883,7 +2963,8 @@ namespace Chisel.Core
                             JobHandleType.vertexBufferContents_subMeshSectionsJobHandle,
                             JobHandleType.subMeshDescriptionsJobHandle,
                             JobHandleType.subMeshSurfacesJobHandle,
-                            JobHandleType.renderMeshesJobHandle),
+                            JobHandleType.renderMeshesJobHandle,
+                            JobHandleType.compactHierarchyJobHandle),   // entityIDLookup reads every hierarchy
                         JobHandles.Write(JobHandleType.vertexBufferContents_triangleBrushIndicesJobHandle));
                     }
 					JobHandle.CombineDependencies(jobHandle1, jobHandle2, jobHandle3).Complete();
@@ -3194,6 +3275,9 @@ namespace Chisel.Core
                 lastJobHandle.AddDependency(Temporaries.meshUpdatesColliders    .SafeDispose(JobHandles[JobHandleType.colliderMeshUpdatesJobHandle].readWriteBarrier));
                 lastJobHandle.AddDependency(Temporaries.meshUpdatesDebugVisualizations.SafeDispose(JobHandles[JobHandleType.debugHelperMeshesJobHandle].readWriteBarrier));
                 lastJobHandle.AddDependency(Temporaries.meshUpdatesRenderables  .SafeDispose(JobHandles[JobHandleType.renderMeshesJobHandle].readWriteBarrier));
+                lastJobHandle.AddDependency(Temporaries.meshUpdatesKept         .SafeDispose(JobHandles[JobHandleType.renderMeshesJobHandle].readWriteBarrier));
+                if (Temporaries.keptSections.IsCreated)
+                    lastJobHandle.AddDependency(Temporaries.keptSections        .SafeDispose(JobHandles[JobHandleType.renderMeshesJobHandle].readWriteBarrier));
                 lastJobHandle.AddDependency(Temporaries.meshDatas               .SafeDispose(JobHandles[JobHandleType.meshDatasJobHandle].readWriteBarrier));                
                 lastJobHandle.AddDependency(Temporaries.subMeshDescriptions     .SafeDispose(JobHandles[JobHandleType.subMeshDescriptionsJobHandle].readWriteBarrier));
                 

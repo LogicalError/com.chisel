@@ -150,12 +150,13 @@ namespace Chisel.Core
         [NoAlias, ReadOnly] public NativeList<OutputModelWeld.Working> work;
         [NoAlias, ReadOnly] public NativeParallelHashMap<long, int>    workIndex;
         [NoAlias, ReadOnly] public NativeParallelHashMap<CompactNodeID, WeldCopyEntry> weldCopyCache;
+        [NoAlias, ReadOnly] public NativeList<OutputModelWeld.VertexMove> vertexMoves;
 
         [NoAlias] public NativeArray<WeldCopy> copies;
 
         public void Execute(int index)
         {
-            copies[index] = OutputModelWeld.CopyPlanned(copies[index], brushRenderData, work, workIndex, weldCopyCache);
+            copies[index] = OutputModelWeld.CopyPlanned(copies[index], brushRenderData, work, workIndex, vertexMoves, weldCopyCache);
         }
     }
 

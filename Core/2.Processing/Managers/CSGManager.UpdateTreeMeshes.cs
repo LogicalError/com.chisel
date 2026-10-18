@@ -2488,6 +2488,7 @@ namespace Chisel.Core
                         work            = Temporaries.weld.work,
                         workIndex       = Temporaries.weld.workIndex,
                         weldCopyCache   = chiselLookupValues.weldCopyCache,
+                        vertexMoves     = Temporaries.weld.moves,
 
                         // Write
                         copies          = Temporaries.weld.copies.AsDeferredJobArray()

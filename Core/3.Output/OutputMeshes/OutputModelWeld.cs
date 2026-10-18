@@ -29,6 +29,8 @@ namespace Chisel.Core
         public NativeList<OutputModelWeld.Working> work;
         public NativeParallelHashMap<long, int> workIndex;
         public NativeList<WeldCopy> copies;
+        // the corners the collapse moved on the surfaces it changed nothing else of (Working.moveStart, moveCount)
+        public NativeList<OutputModelWeld.VertexMove> moves;
 
         public static WeldState Create(Allocator allocator)
         {
@@ -36,7 +38,8 @@ namespace Chisel.Core
             {
                 work      = new NativeList<OutputModelWeld.Working>(16, allocator),
                 workIndex = new NativeParallelHashMap<long, int>(16, allocator),
-                copies    = new NativeList<WeldCopy>(16, allocator)
+                copies    = new NativeList<WeldCopy>(16, allocator),
+                moves     = new NativeList<OutputModelWeld.VertexMove>(16, allocator)
             };
         }
 
@@ -46,6 +49,7 @@ namespace Chisel.Core
             work.Clear();
             workIndex.Clear();
             copies.Clear();
+            moves.Clear();
         }
 
         internal static void FreeWork(NativeList<OutputModelWeld.Working> work)
@@ -69,6 +73,7 @@ namespace Chisel.Core
             }
             if (workIndex.IsCreated) workIndex.Dispose();
             if (copies.IsCreated)    copies.Dispose();
+            if (moves.IsCreated)     moves.Dispose();
         }
 
         public Unity.Jobs.JobHandle Dispose(Unity.Jobs.JobHandle dependency)
@@ -78,7 +83,8 @@ namespace Chisel.Core
             var a = work.IsCreated      ? work.Dispose(dependency)      : dependency;
             var b = workIndex.IsCreated ? workIndex.Dispose(dependency) : dependency;
             var c = copies.IsCreated    ? copies.Dispose(dependency)    : dependency;
-            return Unity.Jobs.JobHandle.CombineDependencies(a, b, c);
+            var d = moves.IsCreated     ? moves.Dispose(dependency)     : dependency;
+            return Unity.Jobs.JobHandle.CombineDependencies(Unity.Jobs.JobHandle.CombineDependencies(a, b, c), d);
         }
     }
 
@@ -95,7 +101,8 @@ namespace Chisel.Core
         // meet (a sphere's pole) planes snapped one by one meet a fraction of a millimetre apart, which only slivers show
         public const float kCollapseLength = 1e-3f;
 
-        // A surface this weld changes: the triangles of one dropped are -1
+        // A surface this weld changes: the triangles of one dropped are -1. One the collapse only moved corners of has no
+        // copy, only its moves (WeldState.moves from moveStart): nothing reads it before Copy
         internal struct Working
         {
             public int                      brush;
@@ -104,6 +111,14 @@ namespace Chisel.Core
             public UnsafeList<float3>       collider;
             public UnsafeList<SelectVertex> select;
             public UnsafeList<RenderVertex> render;
+            public int                      moveStart, moveCount;
+            public readonly bool MovesOnly => !indices.IsCreated;
+        }
+
+        internal struct VertexMove
+        {
+            public int    vertex;
+            public float3 to;
         }
 
         struct Needle
@@ -140,7 +155,7 @@ namespace Chisel.Core
                 PlanWeld(brushes, ref state, out split, out paired, out cancelled, out collapsed, moves);
                 var copies = state.copies.AsArray();
                 for (int i = 0; i < copies.Length; i++)
-                    copies[i] = CopyPlanned(copies[i], brushes.AsArray(), state.work, state.workIndex, default);
+                    copies[i] = CopyPlanned(copies[i], brushes.AsArray(), state.work, state.workIndex, state.moves, default);
                 FinishWeld(brushes, patched, state.copies, default);
             }
             finally
@@ -212,7 +227,7 @@ namespace Chisel.Core
                     changed |= WeldNeedles(brushes, bounds, needles, work, workIndex, fresh, ref split, ref paired);
                 }
                 // last, away from what the steps above changed
-                CollapseShortEdges(brushes, work, workIndex, ref collapsed, moves);
+                CollapseShortEdges(brushes, work, workIndex, state.moves, ref collapsed, moves);
 
                 // the brushes it changed, each once
                 var copied = new NativeArray<bool>(brushes.Length, Allocator.Temp);
@@ -238,12 +253,12 @@ namespace Chisel.Core
         // One changed brush's buffer stored again, or the one the cache kept when it was made from the same; each is
         // independent of the others
         public static WeldCopy CopyPlanned(WeldCopy copy, NativeArray<BrushData> brushes, NativeList<Working> work, NativeParallelHashMap<long, int> workIndex,
-                                           NativeParallelHashMap<CompactNodeID, WeldCopyEntry> cache)
+                                           NativeList<VertexMove> vertexMoves, NativeParallelHashMap<CompactNodeID, WeldCopyEntry> cache)
         {
             var source = brushes[copy.brush].brushRenderBuffer;
             if (cache.IsCreated)
             {
-                copy.keyed = CopyKey(source, copy.brush, work, workIndex, out copy.key);
+                copy.keyed = CopyKey(source, copy.brush, work, workIndex, vertexMoves, out copy.key);
                 if (copy.keyed && cache.TryGetValue(brushes[copy.brush].brushIndexOrder.compactNodeID, out var entry) &&
                     entry.result.IsCreated && entry.key.Equals(copy.key))
                 {
@@ -252,7 +267,7 @@ namespace Chisel.Core
                     return copy;
                 }
             }
-            copy.result = Copy(source, copy.brush, work, workIndex);
+            copy.result = Copy(source, copy.brush, work, workIndex, vertexMoves);
             return copy;
         }
 
@@ -303,7 +318,7 @@ namespace Chisel.Core
 
         // What Copy reads for a brush: its buffer and the weld's working copies of its surfaces
         static unsafe bool CopyKey(BlobAssetReference<ChiselBrushRenderBuffer> source, int brush, NativeList<Working> work,
-                                   NativeParallelHashMap<long, int> workIndex, out uint4 key)
+                                   NativeParallelHashMap<long, int> workIndex, NativeList<VertexMove> vertexMoves, out uint4 key)
         {
             key = default;
             if (!source.IsCreated)
@@ -324,6 +339,13 @@ namespace Chisel.Core
                         continue;
                     var item = work[w];
                     buffer.Add(s);
+                    if (item.MovesOnly)
+                    {
+                        buffer.Add(-1);
+                        buffer.Add(HashOf((byte*)vertexMoves.GetUnsafeReadOnlyPtr() + (long)item.moveStart * UnsafeUtility.SizeOf<VertexMove>(),
+                                          (long)item.moveCount * UnsafeUtility.SizeOf<VertexMove>()));
+                        continue;
+                    }
                     buffer.Add(item.indices.Length);
                     buffer.Add(item.collider.Length);
                     buffer.Add(HashOf(item.indices.Ptr,  (long)item.indices.Length  * sizeof(int)));
@@ -632,7 +654,8 @@ namespace Chisel.Core
 
         // Collapses the model's edges shorter than kCollapseLength (Cluster): every surface of every brush with a corner
         // there moves it, so the model stays closed, and a triangle left without area is dropped
-        static void CollapseShortEdges(NativeList<BrushData> brushes, NativeList<Working> work, NativeParallelHashMap<long, int> workIndex, ref int collapsed,
+        static void CollapseShortEdges(NativeList<BrushData> brushes, NativeList<Working> work,
+                                       NativeParallelHashMap<long, int> workIndex, NativeList<VertexMove> vertexMoves, ref int collapsed,
                                        NativeList<float3x2> moves)
         {
             var limitSq = kCollapseLength * kCollapseLength;
@@ -659,15 +682,15 @@ namespace Chisel.Core
                         // a decal's pieces follow the corners that move, but their short edges do not move anything
                         if (brushes[b].brushRenderBuffer.Value.surfaces[s].decalEntityID != 0)
                             continue;
-                        var count = TriangleCount(brushes, work, workIndex, b, s);
-                        for (int t = 0; t < count; t++)
+                        var view = new SurfaceView(brushes, work, workIndex, b, s);
+                        for (int t = 0; t < view.TriangleCount; t++)
                         {
-                            if (!Corners(brushes, work, workIndex, b, s, t, out var c0, out var c1, out var c2))
+                            if (!view.Corners(t, out var c0, out var c1, out var c2))
                                 continue;
-                            var q0 = Position(brushes, work, workIndex, b, s, c0);
-                            var q1 = Position(brushes, work, workIndex, b, s, c1);
-                            var q2 = Position(brushes, work, workIndex, b, s, c2);
-                            if (IsNeedle(q0, q1, q2) || Changed(brushes, work, workIndex, b, s, t))
+                            var q0 = view.Position(c0);
+                            var q1 = view.Position(c1);
+                            var q2 = view.Position(c2);
+                            if (IsNeedle(q0, q1, q2) || view.Changed(t))
                             {
                                 needlePoints.Add(q0 + 0.0f); needlePoints.Add(q1 + 0.0f); needlePoints.Add(q2 + 0.0f);
                                 continue;
@@ -699,8 +722,11 @@ namespace Chisel.Core
                 var to = new NativeArray<float3>(points.Length, Allocator.Temp);
                 Cluster(points.AsArray(), edges, to);
 
-                // a triangle the collapse leaves without area is dropped, judged from the corners as they were: one the collapse
-                // did not touch stays as it is
+                // surface by surface (what one moves, no other surface reads): a triangle the collapse leaves without area is
+                // dropped, judged from the corners as they were (one the collapse did not touch stays as it is), then every
+                // corner at a position that moves takes its cluster's
+                var targets = new NativeList<float3>(64, Allocator.Temp);
+                var movedAt = new NativeList<byte>(64, Allocator.Temp);
                 for (int b = 0; b < brushes.Length; b++)
                 {
                     if (!brushes[b].brushRenderBuffer.IsCreated)
@@ -708,48 +734,94 @@ namespace Chisel.Core
                     var surfaceCount = brushes[b].brushRenderBuffer.Value.surfaces.Length;
                     for (int s = 0; s < surfaceCount; s++)
                     {
-                        var count = TriangleCount(brushes, work, workIndex, b, s);
-                        for (int t = 0; t < count; t++)
+                        var view = new SurfaceView(brushes, work, workIndex, b, s);
+                        var vertexCount = view.VertexCount;
+                        targets.ResizeUninitialized(vertexCount);
+                        movedAt.Resize(vertexCount, NativeArrayOptions.ClearMemory);
+                        var any = false;
+                        for (int v = 0; v < vertexCount; v++)
                         {
-                            if (!Corners(brushes, work, workIndex, b, s, t, out var c0, out var c1, out var c2))
+                            movedAt[v] = 0;
+                            if (!Moved(view.Position(v), out var at))
                                 continue;
-                            var q0 = Position(brushes, work, workIndex, b, s, c0);
-                            var q1 = Position(brushes, work, workIndex, b, s, c1);
-                            var q2 = Position(brushes, work, workIndex, b, s, c2);
-                            var m0 = Moved(q0, out var p0); var m1 = Moved(q1, out var p1); var m2 = Moved(q2, out var p2);
-                            if ((m0 || m1 || m2) && (p0.Equals(p1) || p1.Equals(p2) || p2.Equals(p0) || math.lengthsq(math.cross(p1 - p0, p2 - p0)) == 0))
-                                Drop(brushes, work, workIndex, b, s, t);
+                            targets[v] = at;
+                            movedAt[v] = 1;
+                            any = true;
                         }
-                    }
-                }
-                // every corner at a position that moves takes its cluster's
-                for (int b = 0; b < brushes.Length; b++)
-                {
-                    if (!brushes[b].brushRenderBuffer.IsCreated)
-                        continue;
-                    var surfaceCount = brushes[b].brushRenderBuffer.Value.surfaces.Length;
-                    for (int s = 0; s < surfaceCount; s++)
-                    {
-                        var count = TriangleCount(brushes, work, workIndex, b, s);
-                        for (int t = 0; t < count; t++)
+                        if (!any)
+                            continue;
+                        var dropped = false;
+                        for (int t = 0; t < view.TriangleCount; t++)
                         {
-                            if (!Corners(brushes, work, workIndex, b, s, t, out var c0, out var c1, out var c2))
+                            if (!view.Corners(t, out var c0, out var c1, out var c2))
                                 continue;
-                            var q0 = Position(brushes, work, workIndex, b, s, c0);
-                            var q1 = Position(brushes, work, workIndex, b, s, c1);
-                            var q2 = Position(brushes, work, workIndex, b, s, c2);
-                            // a corner moved before (by a triangle it shares) is already where its cluster is
-                            var m0 = Moved(q0, out var p0); var m1 = Moved(q1, out var p1); var m2 = Moved(q2, out var p2);
+                            var m0 = movedAt[c0] != 0; var m1 = movedAt[c1] != 0; var m2 = movedAt[c2] != 0;
                             if (!m0 && !m1 && !m2)
                                 continue;
-                            var w = WorkOn(brushes, work, workIndex, b, s);
-                            ref var copy = ref work.ElementAt(w);
-                            if (m0) MoveCorner(ref copy, c0, p0);
-                            if (m1) MoveCorner(ref copy, c1, p1);
-                            if (m2) MoveCorner(ref copy, c2, p2);
+                            var p0 = m0 ? targets[c0] : view.Position(c0);
+                            var p1 = m1 ? targets[c1] : view.Position(c1);
+                            var p2 = m2 ? targets[c2] : view.Position(c2);
+                            if (p0.Equals(p1) || p1.Equals(p2) || p2.Equals(p0) || math.lengthsq(math.cross(p1 - p0, p2 - p0)) == 0)
+                            {
+                                Drop(brushes, work, workIndex, b, s, t);
+                                view = new SurfaceView(brushes, work, workIndex, b, s);
+                                dropped = true;
+                            }
                         }
+                        // the corners of the triangles left
+                        var moveAny = false;
+                        for (int t = 0; t < view.TriangleCount; t++)
+                        {
+                            if (!view.Corners(t, out var c0, out var c1, out var c2))
+                                continue;
+                            if (movedAt[c0] != 0 || movedAt[c1] != 0 || movedAt[c2] != 0)
+                            {
+                                moveAny = true;
+                                break;
+                            }
+                        }
+                        if (!moveAny)
+                            continue;
+                        if (!dropped && Find(workIndex, b, s) < 0)
+                        {
+                            // only corners move: their moves, not a copy
+                            var usedHere = new NativeArray<bool>(vertexCount, Allocator.Temp);
+                            for (int t = 0; t < view.TriangleCount; t++)
+                            {
+                                if (!view.Corners(t, out var c0, out var c1, out var c2))
+                                    continue;
+                                usedHere[c0] = usedHere[c1] = usedHere[c2] = true;
+                            }
+                            var moveStart = vertexMoves.Length;
+                            for (int v = 0; v < vertexCount; v++)
+                            {
+                                if (usedHere[v] && movedAt[v] != 0)
+                                    vertexMoves.Add(new VertexMove { vertex = v, to = targets[v] });
+                            }
+                            usedHere.Dispose();
+                            workIndex.TryAdd(Key(b, s), work.Length);
+                            work.Add(new Working { brush = b, surface = s, moveStart = moveStart, moveCount = vertexMoves.Length - moveStart });
+                            continue;
+                        }
+                        var w = WorkOn(brushes, work, workIndex, b, s);
+                        ref var copy = ref work.ElementAt(w);
+                        var used = new NativeArray<bool>(vertexCount, Allocator.Temp);
+                        for (int t = 0; t + 2 < copy.indices.Length; t += 3)
+                        {
+                            if (copy.indices[t] < 0)
+                                continue;
+                            used[copy.indices[t]] = used[copy.indices[t + 1]] = used[copy.indices[t + 2]] = true;
+                        }
+                        for (int v = 0; v < vertexCount; v++)
+                        {
+                            if (used[v] && movedAt[v] != 0)
+                                MoveCorner(ref copy, v, targets[v]);
+                        }
+                        used.Dispose();
                     }
                 }
+                targets.Dispose();
+                movedAt.Dispose();
                 for (int i = 0; i < points.Length; i++)
                 {
                     if (to[i].Equals(points[i]))
@@ -772,6 +844,65 @@ namespace Chisel.Core
             finally
             {
                 edges.Dispose(); points.Dispose(); ids.Dispose(); pairs.Dispose(); needlePoints.Dispose();
+            }
+        }
+
+        // A surface as the weld has it now (its working copy, or its brush's buffer), looked up once
+        unsafe struct SurfaceView
+        {
+            int*    indices;
+            float3* positions;
+            int*    source;
+            int     indexCount, sourceCount, vertexCount;
+            bool    worked;
+
+            public SurfaceView(NativeList<BrushData> brushes, NativeList<Working> work, NativeParallelHashMap<long, int> workIndex, int brush, int surface)
+            {
+                ref var original = ref brushes[brush].brushRenderBuffer.Value.surfaces[surface];
+                source      = (int*)original.indices.GetUnsafePtr();
+                sourceCount = original.indices.Length;
+                var w = Find(workIndex, brush, surface);
+                worked = w >= 0;
+                if (worked)
+                {
+                    var copy   = work[w];
+                    indices    = copy.indices.Ptr;
+                    indexCount = copy.indices.Length;
+                    positions  = copy.collider.Ptr;
+                    vertexCount = copy.collider.Length;
+                } else
+                {
+                    indices    = source;
+                    indexCount = sourceCount;
+                    positions  = (float3*)original.colliderVertices.GetUnsafePtr();
+                    vertexCount = original.colliderVertices.Length;
+                }
+            }
+
+            public readonly int TriangleCount => indexCount / 3;
+            public readonly int VertexCount => vertexCount;
+
+            public readonly bool Corners(int triangle, out int i0, out int i1, out int i2)
+            {
+                i0 = indices[triangle * 3]; i1 = indices[triangle * 3 + 1]; i2 = indices[triangle * 3 + 2];
+                return i0 >= 0;
+            }
+
+            public readonly float3 Position(int vertex) => positions[vertex];
+
+            // as Changed
+            public readonly bool Changed(int triangle)
+            {
+                if (!worked)
+                    return false;
+                if (triangle * 3 + 2 >= sourceCount)
+                    return true;
+                for (int k = 0; k < 3; k++)
+                {
+                    if (indices[triangle * 3 + k] != source[triangle * 3 + k])
+                        return true;
+                }
+                return false;
             }
         }
 
@@ -959,8 +1090,9 @@ namespace Chisel.Core
 
         // The brush's buffer with its changed surfaces stored again (OutputWeld's rules: only the triangles kept, only the
         // vertices they use, in their order) and the rest copied as they are
-        static BlobAssetReference<ChiselBrushRenderBuffer> Copy(BlobAssetReference<ChiselBrushRenderBuffer> source, int brush,
-                                                                NativeList<Working> work, NativeParallelHashMap<long, int> workIndex)
+        static unsafe BlobAssetReference<ChiselBrushRenderBuffer> Copy(BlobAssetReference<ChiselBrushRenderBuffer> source, int brush,
+                                                                       NativeList<Working> work, NativeParallelHashMap<long, int> workIndex,
+                                                                       NativeList<VertexMove> vertexMoves)
         {
             var builder = new BlobBuilder(Allocator.Temp);
             try
@@ -987,6 +1119,21 @@ namespace Chisel.Core
                     }
 
                     var copy = work[w];
+                    var materialized = copy.MovesOnly;
+                    if (materialized)
+                    {
+                        // the surface as it was with its corners moved
+                        copy.indices  = new UnsafeList<int>(from.indices.Length, Allocator.Temp);
+                        copy.collider = new UnsafeList<float3>(from.colliderVertices.Length, Allocator.Temp);
+                        copy.select   = new UnsafeList<SelectVertex>(from.selectVertices.Length, Allocator.Temp);
+                        copy.render   = new UnsafeList<RenderVertex>(from.renderVertices.Length, Allocator.Temp);
+                        copy.indices .AddRange(from.indices.GetUnsafePtr(),          from.indices.Length);
+                        copy.collider.AddRange(from.colliderVertices.GetUnsafePtr(), from.colliderVertices.Length);
+                        copy.select  .AddRange(from.selectVertices.GetUnsafePtr(),   from.selectVertices.Length);
+                        copy.render  .AddRange(from.renderVertices.GetUnsafePtr(),   from.renderVertices.Length);
+                        for (int m = copy.moveStart; m < copy.moveStart + copy.moveCount; m++)
+                            MoveCorner(ref copy, vertexMoves[m].vertex, vertexMoves[m].to);
+                    }
                     NativeArray<int> used;
                     using var _used    = used    = new NativeArray<int>(copy.collider.Length, Allocator.Temp, NativeArrayOptions.ClearMemory);
                     NativeList<int> indices;
@@ -1019,6 +1166,10 @@ namespace Chisel.Core
                     for (int i = 0; i < indices.Length; i++)
                         indices[i] = used[indices[i]];
                     to.Store(builder, indices, collider, select, render);
+                    if (materialized)
+                    {
+                        copy.indices.Dispose(); copy.collider.Dispose(); copy.select.Dispose(); copy.render.Dispose();
+                    }
                 }
 
                 // The mesh queries' lists of the surfaces, with the changed ones' counts and hashes; a surface left with no

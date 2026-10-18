@@ -137,8 +137,84 @@ namespace Chisel.Core
                 surfaceCountRef.Value = totalSurfaceCount;
 
             // The weld at the very end across the whole model: needles that close a seam go with the triangle across them
-            // (the brushes it changed are stored again by CopyWeldedBrushesJob)
-            OutputModelWeld.PlanWeld(brushRenderData, ref weld, out _, out _, out _, out _, collapseMoves);
+            // (its collapse runs brush by brush in the jobs after this one; the brushes it changed are stored again by
+            // CopyWeldedBrushesJob)
+            OutputModelWeld.PlanWeldBeforeCollapse(brushRenderData, ref weld, out _, out _, out _, collapseMoves);
+        }
+    }
+
+    // The collapse of the weld, brush by brush: each brush's short edges counted (write false), then written where
+    // OffsetShortEdges puts them
+    [BurstCompile(CompileSynchronously = true)]
+    unsafe struct ShortEdgesJob : IJobParallelForDefer
+    {
+        public bool write;
+        [NoAlias, ReadOnly] public NativeArray<BrushData>              brushRenderData;
+        [NoAlias, ReadOnly] public NativeList<OutputModelWeld.Working> work;
+        [NoAlias, ReadOnly] public NativeParallelHashMap<long, int>    workIndex;
+        [NoAlias, ReadOnly] public NativeArray<int2>                   edgeOffsets;
+
+        [NativeDisableParallelForRestriction] [NoAlias] public NativeArray<int2>     edgeCounts;
+        [NativeDisableParallelForRestriction] [NoAlias] public NativeArray<float3x2> shortPairs;
+        [NativeDisableParallelForRestriction] [NoAlias] public NativeArray<float3>   keptCorners;
+
+        public void Execute(int b)
+        {
+            if (!write)
+            {
+                edgeCounts[b] = OutputModelWeld.ShortEdgesOf(b, brushRenderData, work, workIndex, null, null);
+                return;
+            }
+            OutputModelWeld.ShortEdgesOf(b, brushRenderData, work, workIndex,
+                                         (float3x2*)shortPairs.GetUnsafePtr() + edgeOffsets[b].x, (float3*)keptCorners.GetUnsafePtr() + edgeOffsets[b].y);
+        }
+    }
+
+    // The collapse's steps that see the whole model: 0 where each brush's short edges go, 1 the clusters, 2 where each
+    // brush's decisions go, 3 the decisions carried out
+    [BurstCompile(CompileSynchronously = true)]
+    struct CollapseStepJob : IJob
+    {
+        public int step;
+        [NoAlias] public NativeList<BrushData>  brushRenderData;
+        [NoAlias] public NativeList<float3x2>   collapseMoves;
+        [NoAlias] public WeldState              weld;
+
+        public void Execute()
+        {
+            switch (step)
+            {
+                case 0: OutputModelWeld.OffsetShortEdges(ref weld); break;
+                case 1: OutputModelWeld.ClusterShortEdges(ref weld, collapseMoves); break;
+                case 2: OutputModelWeld.OffsetDecisions(ref weld); break;
+                case 3: OutputModelWeld.ApplyCollapse(brushRenderData, ref weld); break;
+            }
+        }
+    }
+
+    // What the collapse does to each brush's surfaces, counted (write false), then written where OffsetDecisions puts it
+    [BurstCompile(CompileSynchronously = true)]
+    unsafe struct DecideCollapseJob : IJobParallelForDefer
+    {
+        public bool write;
+        [NoAlias, ReadOnly] public NativeArray<BrushData>                 brushRenderData;
+        [NoAlias, ReadOnly] public NativeList<OutputModelWeld.Working>    work;
+        [NoAlias, ReadOnly] public NativeParallelHashMap<long, int>       workIndex;
+        [NoAlias, ReadOnly] public NativeParallelHashMap<float3, float3>  movedTo;
+        [NoAlias, ReadOnly] public NativeArray<int>                       decisionOffsets;
+
+        [NativeDisableParallelForRestriction] [NoAlias] public NativeArray<int>                              decisionCounts;
+        [NativeDisableParallelForRestriction] [NoAlias] public NativeArray<OutputModelWeld.CollapseDecision> decisions;
+
+        public void Execute(int b)
+        {
+            if (!write)
+            {
+                decisionCounts[b] = OutputModelWeld.DecideCollapse(b, brushRenderData, work, workIndex, movedTo, null);
+                return;
+            }
+            OutputModelWeld.DecideCollapse(b, brushRenderData, work, workIndex, movedTo,
+                                           (OutputModelWeld.CollapseDecision*)decisions.GetUnsafePtr() + decisionOffsets[b]);
         }
     }
 

@@ -31,6 +31,14 @@ namespace Chisel.Core
         public NativeList<WeldCopy> copies;
         // the corners the collapse moved on the surfaces it changed nothing else of (Working.moveStart, moveCount)
         public NativeList<OutputModelWeld.VertexMove> moves;
+        // the collapse, brush by brush: each brush's short edges and the corners that stay (counts, then where they start),
+        // where the corners that move go, and what it does to each brush's surfaces
+        public NativeList<int2>     edgeCounts, edgeOffsets;
+        public NativeList<float3x2> shortPairs;
+        public NativeList<float3>   keptCorners;
+        public NativeParallelHashMap<float3, float3> movedTo;
+        public NativeList<int>      decisionCounts, decisionOffsets;
+        public NativeList<OutputModelWeld.CollapseDecision> decisions;
 
         public static WeldState Create(Allocator allocator)
         {
@@ -39,7 +47,15 @@ namespace Chisel.Core
                 work      = new NativeList<OutputModelWeld.Working>(16, allocator),
                 workIndex = new NativeParallelHashMap<long, int>(16, allocator),
                 copies    = new NativeList<WeldCopy>(16, allocator),
-                moves     = new NativeList<OutputModelWeld.VertexMove>(16, allocator)
+                moves     = new NativeList<OutputModelWeld.VertexMove>(16, allocator),
+                edgeCounts      = new NativeList<int2>(16, allocator),
+                edgeOffsets     = new NativeList<int2>(16, allocator),
+                shortPairs      = new NativeList<float3x2>(16, allocator),
+                keptCorners     = new NativeList<float3>(16, allocator),
+                movedTo         = new NativeParallelHashMap<float3, float3>(16, allocator),
+                decisionCounts  = new NativeList<int>(16, allocator),
+                decisionOffsets = new NativeList<int>(16, allocator),
+                decisions       = new NativeList<OutputModelWeld.CollapseDecision>(16, allocator)
             };
         }
 
@@ -50,6 +66,8 @@ namespace Chisel.Core
             workIndex.Clear();
             copies.Clear();
             moves.Clear();
+            edgeCounts.Clear(); edgeOffsets.Clear(); shortPairs.Clear(); keptCorners.Clear(); movedTo.Clear();
+            decisionCounts.Clear(); decisionOffsets.Clear(); decisions.Clear();
         }
 
         internal static void FreeWork(NativeList<OutputModelWeld.Working> work)
@@ -74,6 +92,14 @@ namespace Chisel.Core
             if (workIndex.IsCreated) workIndex.Dispose();
             if (copies.IsCreated)    copies.Dispose();
             if (moves.IsCreated)     moves.Dispose();
+            if (edgeCounts.IsCreated)      edgeCounts.Dispose();
+            if (edgeOffsets.IsCreated)     edgeOffsets.Dispose();
+            if (shortPairs.IsCreated)      shortPairs.Dispose();
+            if (keptCorners.IsCreated)     keptCorners.Dispose();
+            if (movedTo.IsCreated)         movedTo.Dispose();
+            if (decisionCounts.IsCreated)  decisionCounts.Dispose();
+            if (decisionOffsets.IsCreated) decisionOffsets.Dispose();
+            if (decisions.IsCreated)       decisions.Dispose();
         }
 
         public Unity.Jobs.JobHandle Dispose(Unity.Jobs.JobHandle dependency)
@@ -84,7 +110,20 @@ namespace Chisel.Core
             var b = workIndex.IsCreated ? workIndex.Dispose(dependency) : dependency;
             var c = copies.IsCreated    ? copies.Dispose(dependency)    : dependency;
             var d = moves.IsCreated     ? moves.Dispose(dependency)     : dependency;
-            return Unity.Jobs.JobHandle.CombineDependencies(Unity.Jobs.JobHandle.CombineDependencies(a, b, c), d);
+            var handles = new NativeArray<Unity.Jobs.JobHandle>(10, Allocator.Temp);
+            handles[0] = Unity.Jobs.JobHandle.CombineDependencies(a, b, c);
+            handles[1] = d;
+            handles[2] = edgeCounts.IsCreated      ? edgeCounts.Dispose(dependency)      : dependency;
+            handles[3] = edgeOffsets.IsCreated     ? edgeOffsets.Dispose(dependency)     : dependency;
+            handles[4] = shortPairs.IsCreated      ? shortPairs.Dispose(dependency)      : dependency;
+            handles[5] = keptCorners.IsCreated     ? keptCorners.Dispose(dependency)     : dependency;
+            handles[6] = movedTo.IsCreated         ? movedTo.Dispose(dependency)         : dependency;
+            handles[7] = decisionCounts.IsCreated  ? decisionCounts.Dispose(dependency)  : dependency;
+            handles[8] = decisionOffsets.IsCreated ? decisionOffsets.Dispose(dependency) : dependency;
+            handles[9] = decisions.IsCreated       ? decisions.Dispose(dependency)       : dependency;
+            var all = Unity.Jobs.JobHandle.CombineDependencies(handles);
+            handles.Dispose();
+            return all;
         }
     }
 
@@ -118,6 +157,15 @@ namespace Chisel.Core
         internal struct VertexMove
         {
             public int    vertex;
+            public float3 to;
+        }
+
+        // What the collapse does to a surface: drops a triangle (index), or moves a corner (index) to
+        internal struct CollapseDecision
+        {
+            public int    surface;
+            public int    index;
+            public bool   move;
             public float3 to;
         }
 
@@ -164,17 +212,40 @@ namespace Chisel.Core
             }
         }
 
-        // Every step of the weld but the copies of the brushes it changed (state.copies, CopyPlanned)
-        public static void PlanWeld(NativeList<BrushData> brushes, ref WeldState state, out int split, out int paired, out int cancelled, out int collapsed,
-                                    NativeList<float3x2> moves = default)
+        // Every step of the weld but the copies of the brushes it changed (state.copies, CopyPlanned), one after another
+        public static unsafe void PlanWeld(NativeList<BrushData> brushes, ref WeldState state, out int split, out int paired, out int cancelled, out int collapsed,
+                                           NativeList<float3x2> moves = default)
+        {
+            PlanWeldBeforeCollapse(brushes, ref state, out split, out paired, out cancelled, moves);
+            var counts = state.edgeCounts.AsArray();
+            for (int b = 0; b < brushes.Length; b++)
+                counts[b] = ShortEdgesOf(b, brushes.AsArray(), state.work, state.workIndex, null, null);
+            OffsetShortEdges(ref state);
+            for (int b = 0; b < brushes.Length; b++)
+                ShortEdgesOf(b, brushes.AsArray(), state.work, state.workIndex,
+                             (float3x2*)state.shortPairs.GetUnsafePtr() + state.edgeOffsets[b].x, (float3*)state.keptCorners.GetUnsafePtr() + state.edgeOffsets[b].y);
+            collapsed = ClusterShortEdges(ref state, moves);
+            var decisionCounts = state.decisionCounts.AsArray();
+            for (int b = 0; b < brushes.Length; b++)
+                decisionCounts[b] = DecideCollapse(b, brushes.AsArray(), state.work, state.workIndex, state.movedTo, null);
+            OffsetDecisions(ref state);
+            for (int b = 0; b < brushes.Length; b++)
+                DecideCollapse(b, brushes.AsArray(), state.work, state.workIndex, state.movedTo,
+                               (CollapseDecision*)state.decisions.GetUnsafePtr() + state.decisionOffsets[b]);
+            ApplyCollapse(brushes, ref state);
+        }
+
+        // The weld up to the collapse (the steps a job takes before ShortEdgesOf runs brush by brush)
+        public static void PlanWeldBeforeCollapse(NativeList<BrushData> brushes, ref WeldState state, out int split, out int paired, out int cancelled,
+                                                  NativeList<float3x2> moves = default)
         {
             if (moves.IsCreated)
                 moves.Clear();
             split = 0;
             paired = 0;
             cancelled = 0;
-            collapsed = 0;
             state.Clear();
+            state.edgeCounts.Resize(brushes.Length, NativeArrayOptions.ClearMemory);
             var needles = new NativeList<Needle>(Allocator.Temp);
             for (int b = 0; b < brushes.Length; b++)
             {
@@ -226,20 +297,6 @@ namespace Chisel.Core
                     changed  = CancelOpposites(brushes, work, workIndex, ref opposites, from, ref cancelled);
                     changed |= WeldNeedles(brushes, bounds, needles, work, workIndex, fresh, ref split, ref paired);
                 }
-                // last, away from what the steps above changed
-                CollapseShortEdges(brushes, work, workIndex, state.moves, ref collapsed, moves);
-
-                // the brushes it changed, each once
-                var copied = new NativeArray<bool>(brushes.Length, Allocator.Temp);
-                for (int k = 0; k < work.Length; k++)
-                {
-                    var brush = work[k].brush;
-                    if (copied[brush])
-                        continue;
-                    copied[brush] = true;
-                    state.copies.Add(new WeldCopy { brush = brush });
-                }
-                copied.Dispose();
             }
             finally
             {
@@ -652,199 +709,267 @@ namespace Chisel.Core
             parent.Dispose(); lo.Dispose(); hi.Dispose(); least.Dispose();
         }
 
-        // Collapses the model's edges shorter than kCollapseLength (Cluster): every surface of every brush with a corner
-        // there moves it, so the model stays closed, and a triangle left without area is dropped
-        static void CollapseShortEdges(NativeList<BrushData> brushes, NativeList<Working> work,
-                                       NativeParallelHashMap<long, int> workIndex, NativeList<VertexMove> vertexMoves, ref int collapsed,
-                                       NativeList<float3x2> moves)
+        // The collapse of the model's edges shorter than kCollapseLength (Cluster), last, away from what the steps before
+        // changed: every surface of every brush with a corner there moves it, so the model stays closed, and a triangle
+        // left without area is dropped. Brush by brush where it can be: ShortEdgesOf, ClusterShortEdges, DecideCollapse,
+        // ApplyCollapse; each brush's part written where the counts put it, so the result is the same in any order.
+
+        // A brush's short edges (pairs) and the corners that stay (kept: a needle's, and those of what the steps before
+        // changed); counts them when pairs is null
+        public static unsafe int2 ShortEdgesOf(int b, NativeArray<BrushData> brushes, NativeList<Working> work, NativeParallelHashMap<long, int> workIndex,
+                                               float3x2* pairs, float3* kept)
         {
+            var count = int2.zero;
+            if (!brushes[b].brushRenderBuffer.IsCreated)
+                return count;
             var limitSq = kCollapseLength * kCollapseLength;
+            var surfaceCount = brushes[b].brushRenderBuffer.Value.surfaces.Length;
+            for (int s = 0; s < surfaceCount; s++)
+            {
+                // a decal's pieces follow the corners that move, but their short edges do not move anything
+                if (brushes[b].brushRenderBuffer.Value.surfaces[s].decalEntityID != 0)
+                    continue;
+                var view = new SurfaceView(brushes, work, workIndex, b, s);
+                for (int t = 0; t < view.TriangleCount; t++)
+                {
+                    if (!view.Corners(t, out var c0, out var c1, out var c2))
+                        continue;
+                    var q0 = view.Position(c0) + 0.0f;
+                    var q1 = view.Position(c1) + 0.0f;
+                    var q2 = view.Position(c2) + 0.0f;
+                    if (IsNeedle(q0, q1, q2) || view.Changed(t))
+                    {
+                        if (kept != null) { kept[count.y] = q0; kept[count.y + 1] = q1; kept[count.y + 2] = q2; }
+                        count.y += 3;
+                        continue;
+                    }
+                    AddShort(q0, q1); AddShort(q1, q2); AddShort(q2, q0);
+                }
+            }
+            return count;
+
+            void AddShort(float3 x, float3 y)
+            {
+                var d = math.distancesq(x, y);
+                if (!(d > 0) || !(d < limitSq))
+                    return;
+                if (pairs != null)
+                    pairs[count.x] = new float3x2(x, y);
+                count.x++;
+            }
+        }
+
+        // Where each brush's short edges and kept corners start, and room for them
+        public static void OffsetShortEdges(ref WeldState state)
+        {
+            var counts = state.edgeCounts;
+            state.edgeOffsets.ResizeUninitialized(counts.Length);
+            var total = int2.zero;
+            for (int b = 0; b < counts.Length; b++)
+            {
+                state.edgeOffsets[b] = total;
+                total += counts[b];
+            }
+            state.shortPairs.ResizeUninitialized(total.x);
+            state.keptCorners.ResizeUninitialized(total.y);
+        }
+
+        // Where the corners that move go (movedTo); the number of them. moves: (from, to) of each
+        public static int ClusterShortEdges(ref WeldState state, NativeList<float3x2> moves)
+        {
+            var collapsed = 0;
+            state.movedTo.Clear();
+            state.decisionCounts.Resize(state.edgeCounts.Length, NativeArrayOptions.ClearMemory);
             var ids    = new UnsafeHashMap<float3, int>(64, Allocator.Temp);
             var points = new NativeList<float3>(64, Allocator.Temp);
             var edges  = new NativeList<ShortEdge>(64, Allocator.Temp);
-            var pairs  = new NativeList<float3x2>(64, Allocator.Temp);
-            var needlePoints = new UnsafeHashSet<float3>(64, Allocator.Temp);
+            var keptPoints = new UnsafeHashSet<float3>(math.max(16, state.keptCorners.Length), Allocator.Temp);
             int IdOf(float3 p)
             {
-                p += 0.0f;
                 if (!ids.TryGetValue(p, out var id)) { id = points.Length; ids.Add(p, id); points.Add(p); }
                 return id;
             }
             try
             {
-                for (int b = 0; b < brushes.Length; b++)
-                {
-                    if (!brushes[b].brushRenderBuffer.IsCreated)
-                        continue;
-                    var surfaceCount = brushes[b].brushRenderBuffer.Value.surfaces.Length;
-                    for (int s = 0; s < surfaceCount; s++)
-                    {
-                        // a decal's pieces follow the corners that move, but their short edges do not move anything
-                        if (brushes[b].brushRenderBuffer.Value.surfaces[s].decalEntityID != 0)
-                            continue;
-                        var view = new SurfaceView(brushes, work, workIndex, b, s);
-                        for (int t = 0; t < view.TriangleCount; t++)
-                        {
-                            if (!view.Corners(t, out var c0, out var c1, out var c2))
-                                continue;
-                            var q0 = view.Position(c0);
-                            var q1 = view.Position(c1);
-                            var q2 = view.Position(c2);
-                            if (IsNeedle(q0, q1, q2) || view.Changed(t))
-                            {
-                                needlePoints.Add(q0 + 0.0f); needlePoints.Add(q1 + 0.0f); needlePoints.Add(q2 + 0.0f);
-                                continue;
-                            }
-                            AddShort(q0, q1); AddShort(q1, q2); AddShort(q2, q0);
-                        }
-                    }
-                }
-                // a needle's corners stay, and those of what the steps above changed: those are theirs
+                var kept = state.keptCorners;
+                for (int i = 0; i < kept.Length; i++)
+                    keptPoints.Add(kept[i]);
+                // a needle's corners stay, and those of what the steps before changed: those are theirs
+                var pairs = state.shortPairs;
                 for (int e = 0; e < pairs.Length; e++)
                 {
                     var x = pairs[e].c0; var y = pairs[e].c1;
-                    if (needlePoints.Contains(x) || needlePoints.Contains(y))
+                    if (keptPoints.Contains(x) || keptPoints.Contains(y))
                         continue;
                     int a = IdOf(x), c = IdOf(y);
                     edges.Add(new ShortEdge { a = math.min(a, c), b = math.max(a, c), length = math.distance(x, y) });
                 }
                 if (edges.Length == 0)
-                    return;
-
-                void AddShort(float3 x, float3 y)
-                {
-                    var d = math.distancesq(x, y);
-                    if (!(d > 0) || !(d < limitSq))
-                        return;
-                    pairs.Add(new float3x2(x + 0.0f, y + 0.0f));
-                }
+                    return 0;
 
                 var to = new NativeArray<float3>(points.Length, Allocator.Temp);
                 Cluster(points.AsArray(), edges, to);
-
-                // surface by surface (what one moves, no other surface reads): a triangle the collapse leaves without area is
-                // dropped, judged from the corners as they were (one the collapse did not touch stays as it is), then every
-                // corner at a position that moves takes its cluster's
-                var targets = new NativeList<float3>(64, Allocator.Temp);
-                var movedAt = new NativeList<byte>(64, Allocator.Temp);
-                for (int b = 0; b < brushes.Length; b++)
-                {
-                    if (!brushes[b].brushRenderBuffer.IsCreated)
-                        continue;
-                    var surfaceCount = brushes[b].brushRenderBuffer.Value.surfaces.Length;
-                    for (int s = 0; s < surfaceCount; s++)
-                    {
-                        var view = new SurfaceView(brushes, work, workIndex, b, s);
-                        var vertexCount = view.VertexCount;
-                        targets.ResizeUninitialized(vertexCount);
-                        movedAt.Resize(vertexCount, NativeArrayOptions.ClearMemory);
-                        var any = false;
-                        for (int v = 0; v < vertexCount; v++)
-                        {
-                            movedAt[v] = 0;
-                            if (!Moved(view.Position(v), out var at))
-                                continue;
-                            targets[v] = at;
-                            movedAt[v] = 1;
-                            any = true;
-                        }
-                        if (!any)
-                            continue;
-                        var dropped = false;
-                        for (int t = 0; t < view.TriangleCount; t++)
-                        {
-                            if (!view.Corners(t, out var c0, out var c1, out var c2))
-                                continue;
-                            var m0 = movedAt[c0] != 0; var m1 = movedAt[c1] != 0; var m2 = movedAt[c2] != 0;
-                            if (!m0 && !m1 && !m2)
-                                continue;
-                            var p0 = m0 ? targets[c0] : view.Position(c0);
-                            var p1 = m1 ? targets[c1] : view.Position(c1);
-                            var p2 = m2 ? targets[c2] : view.Position(c2);
-                            if (p0.Equals(p1) || p1.Equals(p2) || p2.Equals(p0) || math.lengthsq(math.cross(p1 - p0, p2 - p0)) == 0)
-                            {
-                                Drop(brushes, work, workIndex, b, s, t);
-                                view = new SurfaceView(brushes, work, workIndex, b, s);
-                                dropped = true;
-                            }
-                        }
-                        // the corners of the triangles left
-                        var moveAny = false;
-                        for (int t = 0; t < view.TriangleCount; t++)
-                        {
-                            if (!view.Corners(t, out var c0, out var c1, out var c2))
-                                continue;
-                            if (movedAt[c0] != 0 || movedAt[c1] != 0 || movedAt[c2] != 0)
-                            {
-                                moveAny = true;
-                                break;
-                            }
-                        }
-                        if (!moveAny)
-                            continue;
-                        if (!dropped && Find(workIndex, b, s) < 0)
-                        {
-                            // only corners move: their moves, not a copy
-                            var usedHere = new NativeArray<bool>(vertexCount, Allocator.Temp);
-                            for (int t = 0; t < view.TriangleCount; t++)
-                            {
-                                if (!view.Corners(t, out var c0, out var c1, out var c2))
-                                    continue;
-                                usedHere[c0] = usedHere[c1] = usedHere[c2] = true;
-                            }
-                            var moveStart = vertexMoves.Length;
-                            for (int v = 0; v < vertexCount; v++)
-                            {
-                                if (usedHere[v] && movedAt[v] != 0)
-                                    vertexMoves.Add(new VertexMove { vertex = v, to = targets[v] });
-                            }
-                            usedHere.Dispose();
-                            workIndex.TryAdd(Key(b, s), work.Length);
-                            work.Add(new Working { brush = b, surface = s, moveStart = moveStart, moveCount = vertexMoves.Length - moveStart });
-                            continue;
-                        }
-                        var w = WorkOn(brushes, work, workIndex, b, s);
-                        ref var copy = ref work.ElementAt(w);
-                        var used = new NativeArray<bool>(vertexCount, Allocator.Temp);
-                        for (int t = 0; t + 2 < copy.indices.Length; t += 3)
-                        {
-                            if (copy.indices[t] < 0)
-                                continue;
-                            used[copy.indices[t]] = used[copy.indices[t + 1]] = used[copy.indices[t + 2]] = true;
-                        }
-                        for (int v = 0; v < vertexCount; v++)
-                        {
-                            if (used[v] && movedAt[v] != 0)
-                                MoveCorner(ref copy, v, targets[v]);
-                        }
-                        used.Dispose();
-                    }
-                }
-                targets.Dispose();
-                movedAt.Dispose();
                 for (int i = 0; i < points.Length; i++)
                 {
                     if (to[i].Equals(points[i]))
                         continue;
                     collapsed++;
+                    state.movedTo.TryAdd(points[i], to[i]);
                     if (moves.IsCreated)
                         moves.Add(new float3x2(points[i], to[i]));
                 }
                 to.Dispose();
-
-                bool Moved(float3 q, out float3 at)
-                {
-                    at = q;
-                    if (!ids.TryGetValue(q + 0.0f, out var id) || to[id].Equals(points[id]))
-                        return false;
-                    at = to[id];
-                    return true;
-                }
+                return collapsed;
             }
             finally
             {
-                edges.Dispose(); points.Dispose(); ids.Dispose(); pairs.Dispose(); needlePoints.Dispose();
+                edges.Dispose(); points.Dispose(); ids.Dispose(); keptPoints.Dispose();
             }
+        }
+
+        // What the collapse does to a brush's surfaces (counts it when decisions is null): surface by surface, a triangle the
+        // collapse leaves without area is dropped, judged from the corners as they were (one the collapse did not touch stays
+        // as it is), and every corner of a triangle left at a position that moves takes its cluster's
+        public static unsafe int DecideCollapse(int b, NativeArray<BrushData> brushes, NativeList<Working> work, NativeParallelHashMap<long, int> workIndex,
+                                                NativeParallelHashMap<float3, float3> movedTo, CollapseDecision* decisions)
+        {
+            var count = 0;
+            if (!brushes[b].brushRenderBuffer.IsCreated || movedTo.Count() == 0)
+                return 0;
+            var targets = new NativeList<float3>(64, Allocator.Temp);
+            var movedAt = new NativeList<bool>(64, Allocator.Temp);
+            var dropped = new NativeList<bool>(64, Allocator.Temp);
+            var surfaceCount = brushes[b].brushRenderBuffer.Value.surfaces.Length;
+            for (int s = 0; s < surfaceCount; s++)
+            {
+                var view = new SurfaceView(brushes, work, workIndex, b, s);
+                var vertexCount = view.VertexCount;
+                targets.ResizeUninitialized(vertexCount);
+                movedAt.Resize(vertexCount, NativeArrayOptions.ClearMemory);
+                var any = false;
+                for (int v = 0; v < vertexCount; v++)
+                {
+                    movedAt[v] = false;
+                    if (!movedTo.TryGetValue(view.Position(v) + 0.0f, out var at))
+                        continue;
+                    targets[v] = at;
+                    movedAt[v] = true;
+                    any = true;
+                }
+                if (!any)
+                    continue;
+                dropped.Resize(view.TriangleCount, NativeArrayOptions.ClearMemory);
+                for (int t = 0; t < view.TriangleCount; t++)
+                {
+                    dropped[t] = false;
+                    if (!view.Corners(t, out var c0, out var c1, out var c2))
+                        continue;
+                    var m0 = movedAt[c0]; var m1 = movedAt[c1]; var m2 = movedAt[c2];
+                    if (!m0 && !m1 && !m2)
+                        continue;
+                    var p0 = m0 ? targets[c0] : view.Position(c0);
+                    var p1 = m1 ? targets[c1] : view.Position(c1);
+                    var p2 = m2 ? targets[c2] : view.Position(c2);
+                    if (!(p0.Equals(p1) || p1.Equals(p2) || p2.Equals(p0) || math.lengthsq(math.cross(p1 - p0, p2 - p0)) == 0))
+                        continue;
+                    dropped[t] = true;
+                    if (decisions != null)
+                        decisions[count] = new CollapseDecision { surface = s, index = t };
+                    count++;
+                }
+                // the corners of the triangles left
+                var used = new NativeArray<bool>(vertexCount, Allocator.Temp);
+                for (int t = 0; t < view.TriangleCount; t++)
+                {
+                    if (dropped[t] || !view.Corners(t, out var c0, out var c1, out var c2))
+                        continue;
+                    used[c0] = used[c1] = used[c2] = true;
+                }
+                for (int v = 0; v < vertexCount; v++)
+                {
+                    if (!used[v] || !movedAt[v])
+                        continue;
+                    if (decisions != null)
+                        decisions[count] = new CollapseDecision { surface = s, index = v, move = true, to = targets[v] };
+                    count++;
+                }
+                used.Dispose();
+            }
+            targets.Dispose(); movedAt.Dispose(); dropped.Dispose();
+            return count;
+        }
+
+        // Where each brush's decisions start, and room for them
+        public static void OffsetDecisions(ref WeldState state)
+        {
+            var counts = state.decisionCounts;
+            state.decisionOffsets.ResizeUninitialized(counts.Length);
+            var total = 0;
+            for (int b = 0; b < counts.Length; b++)
+            {
+                state.decisionOffsets[b] = total;
+                total += counts[b];
+            }
+            state.decisions.ResizeUninitialized(total);
+        }
+
+        // The decisions carried out, surface by surface (a surface where nothing was dropped and nothing else of it changed
+        // keeps only its moves); then the brushes the weld changed, each once
+        public static void ApplyCollapse(NativeList<BrushData> brushes, ref WeldState state)
+        {
+            var work      = state.work;
+            var workIndex = state.workIndex;
+            var decisions = state.decisions;
+            for (int b = 0; b < state.decisionCounts.Length && b < brushes.Length; b++)
+            {
+                var start = state.decisionOffsets[b];
+                var end   = start + state.decisionCounts[b];
+                for (int i = start; i < end;)
+                {
+                    var s = decisions[i].surface;
+                    var last = i;
+                    var drops = false;
+                    while (last < end && decisions[last].surface == s)
+                    {
+                        drops |= !decisions[last].move;
+                        last++;
+                    }
+                    if (!drops && Find(workIndex, b, s) < 0)
+                    {
+                        var moveStart = state.moves.Length;
+                        for (int k = i; k < last; k++)
+                            state.moves.Add(new VertexMove { vertex = decisions[k].index, to = decisions[k].to });
+                        workIndex.TryAdd(Key(b, s), work.Length);
+                        work.Add(new Working { brush = b, surface = s, moveStart = moveStart, moveCount = state.moves.Length - moveStart });
+                    } else
+                    {
+                        for (int k = i; k < last; k++)
+                        {
+                            if (!decisions[k].move)
+                                Drop(brushes, work, workIndex, b, s, decisions[k].index);
+                        }
+                        var w = WorkOn(brushes, work, workIndex, b, s);
+                        ref var copy = ref work.ElementAt(w);
+                        for (int k = i; k < last; k++)
+                        {
+                            if (decisions[k].move)
+                                MoveCorner(ref copy, decisions[k].index, decisions[k].to);
+                        }
+                    }
+                    i = last;
+                }
+            }
+
+            var copied = new NativeArray<bool>(brushes.Length, Allocator.Temp);
+            for (int k = 0; k < work.Length; k++)
+            {
+                var brush = work[k].brush;
+                if (copied[brush])
+                    continue;
+                copied[brush] = true;
+                state.copies.Add(new WeldCopy { brush = brush });
+            }
+            copied.Dispose();
         }
 
         // A surface as the weld has it now (its working copy, or its brush's buffer), looked up once
@@ -856,7 +981,7 @@ namespace Chisel.Core
             int     indexCount, sourceCount, vertexCount;
             bool    worked;
 
-            public SurfaceView(NativeList<BrushData> brushes, NativeList<Working> work, NativeParallelHashMap<long, int> workIndex, int brush, int surface)
+            public SurfaceView(NativeArray<BrushData> brushes, NativeList<Working> work, NativeParallelHashMap<long, int> workIndex, int brush, int surface)
             {
                 ref var original = ref brushes[brush].brushRenderBuffer.Value.surfaces[surface];
                 source      = (int*)original.indices.GetUnsafePtr();

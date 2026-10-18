@@ -2481,6 +2481,53 @@ namespace Chisel.Core
                             JobHandleType.brushRenderDataJobHandle,
                             JobHandleType.surfaceCountRefJobHandle));
 
+                    // the weld's collapse, brush by brush where it can be
+                    {
+                        var weld = Temporaries.weld;
+                        for (int pass = 0; pass < 2; pass++)
+                        {
+                            var shortEdgesJob = new ShortEdgesJob
+                            {
+                                write           = pass == 1,
+                                brushRenderData = Temporaries.brushRenderData.AsDeferredJobArray(),
+                                work            = weld.work,
+                                workIndex       = weld.workIndex,
+                                edgeOffsets     = weld.edgeOffsets.AsDeferredJobArray(),
+                                edgeCounts      = weld.edgeCounts.AsDeferredJobArray(),
+                                shortPairs      = weld.shortPairs.AsDeferredJobArray(),
+                                keptCorners     = weld.keptCorners.AsDeferredJobArray()
+                            };
+                            shortEdgesJob.Schedule(runInParallel, Temporaries.brushRenderData, 16,
+                                JobHandles.Read(JobHandleType.decalVolumesJobHandle),
+                                JobHandles.Write(JobHandleType.brushRenderDataJobHandle));
+                            var stepJob = new CollapseStepJob { step = pass, brushRenderData = Temporaries.brushRenderData, collapseMoves = chiselLookupValues.collapseMoves, weld = weld };
+                            stepJob.Schedule(runInParallel,
+                                JobHandles.Read(JobHandleType.decalVolumesJobHandle),
+                                JobHandles.Write(JobHandleType.brushRenderDataJobHandle));
+                        }
+                        for (int pass = 0; pass < 2; pass++)
+                        {
+                            var decideJob = new DecideCollapseJob
+                            {
+                                write           = pass == 1,
+                                brushRenderData = Temporaries.brushRenderData.AsDeferredJobArray(),
+                                work            = weld.work,
+                                workIndex       = weld.workIndex,
+                                movedTo         = weld.movedTo,
+                                decisionOffsets = weld.decisionOffsets.AsDeferredJobArray(),
+                                decisionCounts  = weld.decisionCounts.AsDeferredJobArray(),
+                                decisions       = weld.decisions.AsDeferredJobArray()
+                            };
+                            decideJob.Schedule(runInParallel, Temporaries.brushRenderData, 16,
+                                JobHandles.Read(JobHandleType.decalVolumesJobHandle),
+                                JobHandles.Write(JobHandleType.brushRenderDataJobHandle));
+                            var stepJob = new CollapseStepJob { step = 2 + pass, brushRenderData = Temporaries.brushRenderData, collapseMoves = chiselLookupValues.collapseMoves, weld = weld };
+                            stepJob.Schedule(runInParallel,
+                                JobHandles.Read(JobHandleType.decalVolumesJobHandle),
+                                JobHandles.Write(JobHandleType.brushRenderDataJobHandle));
+                        }
+                    }
+
                     var copyWeldedBrushesJob = new CopyWeldedBrushesJob
                     {
                         // Read

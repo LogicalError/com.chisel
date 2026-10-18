@@ -218,6 +218,111 @@ namespace Chisel.Core
         }
     }
 
+    // Marks the sections whose mesh is made from the same as last time (keptSections), remembers what each was made from,
+    // and gives each render mesh the hash of what its lightmap layout is made from (sectionLightmapHashes); kept: how
+    // many are kept. A query's own material meshes and the colliders are kept; the shadow-only and debug meshes are
+    // always made again.
+    [BurstCompile(CompileSynchronously = true)]
+    unsafe struct FindKeptSectionsJob : IJob
+    {
+        [NoAlias, ReadOnly] public NativeList<SubMeshSection>                sections;
+        [NoAlias, ReadOnly] public NativeList<SubMeshDescriptions>           descriptions;
+        [NoAlias, ReadOnly] public NativeArray<UnsafeList<SubMeshSurface>>   subMeshSurfaces;
+        public LightmapUVSettings lightmapUVSettings;
+
+        [NoAlias] public NativeParallelHashMap<RenderMeshKey, uint4> hashes;
+        [NoAlias] public NativeArray<bool>   keptSections;
+        [NoAlias] public NativeArray<uint>   sectionLightmapHashes;
+        [NoAlias] public NativeReference<int> kept;
+
+        public void Execute()
+        {
+            var seen   = new NativeParallelHashSet<RenderMeshKey>(math.max(1, sections.Length), Allocator.Temp);
+            var buffer = new UnsafeAppendBuffer(256, 16, Allocator.Temp);
+            var count  = 0;
+            for (int i = 0; i < sections.Length; i++)
+            {
+                var section  = sections[i];
+                var collider = section.meshQuery.LayerParameterIndex == SurfaceParameterIndex.PhysicsMaterial;
+                var render   = section.meshQuery.LayerParameterIndex == SurfaceParameterIndex.RenderMaterial;
+                if (render)
+                    sectionLightmapHashes[i] = LightmapHash(section, ref buffer);
+                if (!hashes.IsCreated ||
+                    !(collider || GatherSurfacesJob.OneMeshPerMaterial(section.meshQuery)) ||
+                    (render && section.endIndex - section.startIndex != 1))
+                    continue;
+                // a collider's section is the one description it starts at
+                var description = descriptions[section.startIndex];
+                buffer.Reset();
+                if (render)
+                {
+                    buffer.Add(description.geometryHashValue);
+                    buffer.Add(description.surfaceHashValue);
+                    buffer.Add(description.vertexCount);
+                    buffer.Add(description.indexCount);
+                    buffer.Add(lightmapUVSettings);
+                }
+                var surfaces = subMeshSurfaces[description.meshQueryIndex];
+                for (int s = description.surfacesOffset; s < description.surfacesOffset + description.surfacesCount && s < surfaces.Length; s++)
+                {
+                    buffer.Add(surfaces[s].brushNodeID);
+                    buffer.Add(surfaces[s].surfaceIndex);
+                    // a collider is the shape as the weld left it, before any hotspot cut
+                    if (collider && surfaces[s].brushRenderBuffer.IsCreated)
+                        buffer.Add(surfaces[s].brushRenderBuffer.Value.surfaces[surfaces[s].surfaceIndex].shapeHashValue);
+                }
+                var hash = xxHash3.Hash128(buffer.Ptr, buffer.Length);
+                var key  = new RenderMeshKey { query = (int)section.meshQuery.LayerQuery, surfaceParameter = description.surfaceParameter, chunk = description.chunk };
+                if (!seen.Add(key))
+                    continue;
+                if (hashes.TryGetValue(key, out var last) && last.Equals(hash))
+                {
+                    keptSections[i] = true;
+                    count++;
+                }
+                hashes[key] = hash;
+            }
+            if (hashes.IsCreated)
+            {
+                // the meshes this update does not have any more
+                using var keys = hashes.GetKeyArray(Allocator.Temp);
+                for (int k = 0; k < keys.Length; k++)
+                {
+                    if (!seen.Contains(keys[k]))
+                        hashes.Remove(keys[k]);
+                }
+            }
+            buffer.Dispose();
+            seen.Dispose();
+            kept.Value = count;
+        }
+
+        // What a render mesh's lightmap layout is made from (ChiselOutputRenderable): each surface's chart, which the
+        // CSG made before any hotspot cut, and the layout settings
+        uint LightmapHash(SubMeshSection section, ref UnsafeAppendBuffer buffer)
+        {
+            buffer.Reset();
+            buffer.Add(lightmapUVSettings);
+            for (int d = section.startIndex; d < section.endIndex; d++)
+            {
+                var description = descriptions[d];
+                var surfaces    = subMeshSurfaces[description.meshQueryIndex];
+                for (int s = description.surfacesOffset; s < description.surfacesOffset + description.surfacesCount && s < surfaces.Length; s++)
+                {
+                    if (!surfaces[s].brushRenderBuffer.IsCreated)
+                        continue;
+                    ref var surface = ref surfaces[s].brushRenderBuffer.Value.surfaces[surfaces[s].surfaceIndex];
+                    var drawn = surface.indices.Length > 0 && surface.renderVertices.Length > 0;
+                    buffer.Add(surface.lightmapChart);
+                    buffer.Add(drawn ? (int)LightmapUVLayout.ModeOf(surface.outputFlags) : -1);
+                    buffer.Add(surface.shapeHashValue);
+                    buffer.Add(surfaces[s].surfaceIndex);
+                }
+            }
+            return xxHash3.Hash64(buffer.Ptr, buffer.Length).x;
+        }
+    }
+
     // Each brush the weld changed, stored again on its own
     [BurstCompile(CompileSynchronously = true)]
     struct CopyWeldedBrushesJob : IJobParallelForDefer
@@ -226,13 +331,13 @@ namespace Chisel.Core
         [NoAlias, ReadOnly] public NativeList<OutputModelWeld.Working> work;
         [NoAlias, ReadOnly] public NativeParallelHashMap<long, int>    workIndex;
         [NoAlias, ReadOnly] public NativeParallelHashMap<CompactNodeID, WeldCopyEntry> weldCopyCache;
-        [NoAlias, ReadOnly] public NativeList<OutputModelWeld.VertexMove> vertexMoves;
+        [NoAlias, ReadOnly] public NativeList<OutputModelWeld.CollapseDecision> collapseDecisions;
 
         [NoAlias] public NativeArray<WeldCopy> copies;
 
         public void Execute(int index)
         {
-            copies[index] = OutputModelWeld.CopyPlanned(copies[index], brushRenderData, work, workIndex, vertexMoves, weldCopyCache);
+            copies[index] = OutputModelWeld.CopyPlanned(copies[index], brushRenderData, work, workIndex, collapseDecisions, weldCopyCache);
         }
     }
 

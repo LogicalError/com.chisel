@@ -59,6 +59,9 @@ namespace Chisel.Components
         [System.NonSerialized] public bool partialMeshDirty = true;
         [System.NonSerialized] int  partialMeshVisibilityVersion = -1;
         [System.NonSerialized] bool partialMeshShown;
+        // every brush of the mesh is visible: the scene view draws the mesh itself, not a partial copy of it
+        [System.NonSerialized] bool partialIsShared;
+        public Mesh DrawnMesh => partialIsShared ? sharedMesh : partialMesh;
         public Mesh             selectionMesh;
         [NonSerialized, HideInInspector]
         public bool             visible;
@@ -877,14 +880,41 @@ namespace Chisel.Components
             var srcMesh = sharedMesh;
             var dstMesh = partialMesh;
 
+            partialIsShared = false;
             if (!showMesh)
             {
                 dstMesh.Clear(keepVertexLayout: true);
                 return;
             }
 
+            if (AllBrushesVisible(visibilityLookup))
+            {
+                partialIsShared = true;
+                if (dstMesh.vertexCount > 0)
+                    dstMesh.Clear(keepVertexLayout: true);
+                return;
+            }
+
             triangleBrushes.GenerateSubMesh(visibilityLookup, srcMesh, dstMesh);
 		}
+
+        bool AllBrushesVisible(BrushVisibilityLookup visibilityLookup)
+        {
+            var descriptions = triangleBrushes.selectionIndexDescriptions;
+            if (descriptions == null || descriptions.Length == 0)
+                return false;
+            var last = CompactNodeID.Invalid;
+            for (int i = 0; i < descriptions.Length; i++)
+            {
+                var brush = descriptions[i].brushNodeID;
+                if (i > 0 && brush == last)
+                    continue;
+                if (!visibilityLookup.IsBrushVisible(brush))
+                    return false;
+                last = brush;
+            }
+            return true;
+        }
 
 
 
@@ -1021,7 +1051,7 @@ namespace Chisel.Components
 					continue;
 				if (!renderable.IsEnabled())
 					continue;
-				renderable.RenderMesh(renderable.partialMesh, materialPropertyBlock, matrix, layer, camera, hasLightmaps);
+				renderable.RenderMesh(renderable.DrawnMesh, materialPropertyBlock, matrix, layer, camera, hasLightmaps);
 			}
 		}
 

@@ -38,6 +38,12 @@ namespace Chisel.Core
         public NativeList<HotspotCutWork> work;
         // each brush's own buffer, before the weld's copies (PlanCut's kept)
         public NativeList<BlobAssetReference<ChiselBrushRenderBuffer>> kept;
+        // what the cut reads, worked out before the cache is asked (StartCutKeys, BrushCutKey): each group's key, what
+        // every brush reads, and each brush's key; brushCuts: 0 not cut, 1 cut and keyed, 2 cut every time
+        public NativeList<uint4> groupKeys;
+        public NativeReference<uint4> globalKey;
+        public NativeList<uint4> brushKeys;
+        public NativeList<byte>  brushCuts;
 
         public static HotspotCutState Create(Allocator allocator)
         {
@@ -51,7 +57,11 @@ namespace Chisel.Core
                 halfPlanes = new NativeList<HotspotSectionHalfPlane>(64, allocator),
                 cells      = new NativeList<HotspotSectionCell>(32, allocator),
                 work       = new NativeList<HotspotCutWork>(16, allocator),
-                kept       = new NativeList<BlobAssetReference<ChiselBrushRenderBuffer>>(16, allocator)
+                kept       = new NativeList<BlobAssetReference<ChiselBrushRenderBuffer>>(16, allocator),
+                groupKeys  = new NativeList<uint4>(16, allocator),
+                globalKey  = new NativeReference<uint4>(allocator),
+                brushKeys  = new NativeList<uint4>(16, allocator),
+                brushCuts  = new NativeList<byte>(16, allocator)
             };
         }
 
@@ -69,6 +79,10 @@ namespace Chisel.Core
             if (cells.IsCreated)      cells.Dispose();
             if (work.IsCreated)       work.Dispose();
             if (kept.IsCreated)       kept.Dispose();
+            if (groupKeys.IsCreated)  groupKeys.Dispose();
+            if (globalKey.IsCreated)  globalKey.Dispose();
+            if (brushKeys.IsCreated)  brushKeys.Dispose();
+            if (brushCuts.IsCreated)  brushCuts.Dispose();
         }
 
         public Unity.Jobs.JobHandle Dispose(Unity.Jobs.JobHandle dependency)
@@ -76,7 +90,7 @@ namespace Chisel.Core
             // the maps as the jobs left them, then their references
             if (groupOfRef.IsCreated && unfoldOfRef.IsCreated)
                 dependency = Unity.Jobs.IJobExtensions.Schedule(new DisposeHotspotCutMapsJob { groupOf = groupOfRef, unfoldOf = unfoldOfRef }, dependency);
-            var handles = new NativeArray<Unity.Jobs.JobHandle>(9, Allocator.Temp);
+            var handles = new NativeArray<Unity.Jobs.JobHandle>(13, Allocator.Temp);
             for (int i = 0; i < handles.Length; i++)
                 handles[i] = dependency;
             if (groupOfRef.IsCreated)  handles[0] = groupOfRef.Dispose(dependency);
@@ -88,6 +102,10 @@ namespace Chisel.Core
             if (cells.IsCreated)      handles[6] = cells.Dispose(dependency);
             if (work.IsCreated)       handles[7] = work.Dispose(dependency);
             if (kept.IsCreated)       handles[8] = kept.Dispose(dependency);
+            if (groupKeys.IsCreated)  handles[9] = groupKeys.Dispose(dependency);
+            if (globalKey.IsCreated)  handles[10] = globalKey.Dispose(dependency);
+            if (brushKeys.IsCreated)  handles[11] = brushKeys.Dispose(dependency);
+            if (brushCuts.IsCreated)  handles[12] = brushCuts.Dispose(dependency);
             var all = Unity.Jobs.JobHandle.CombineDependencies(handles);
             handles.Dispose();
             return all;
@@ -150,6 +168,23 @@ namespace Chisel.Core
                                               NativeArray<BlobAssetReference<ChiselBrushRenderBuffer>> kept, NativeArray<ulong> variants,
                                               NativeParallelHashMap<CompactNodeID, HotspotCutEntry> cache, ref HotspotCutState state)
         {
+            StartCutKeys(brushes, layouts, tileSides, kept, variants, cache.IsCreated, ref state);
+            var keys = state.brushKeys.AsArray();
+            var cuts = state.brushCuts.AsArray();
+            for (int b = 0; b < brushes.Length; b++)
+            {
+                cuts[b] = BrushCutKey(b, brushes.AsArray(), state.GroupOf, state.UnfoldOf, state.bordersOf, state.groupKeys.AsArray(), state.globalKey.Value,
+                                      cache.IsCreated, out var key);
+                keys[b] = key;
+            }
+            FinishCutKeys(brushes, cache, ref state);
+        }
+
+        // The groups' ids and keys, told to each brush's own buffer, and room for each brush's key (BrushCutKey)
+        public static void StartCutKeys(NativeList<BrushData> brushes, NativeArray<HotspotLayoutData> layouts, NativeArray<float4> tileSides,
+                                        NativeArray<BlobAssetReference<ChiselBrushRenderBuffer>> kept, NativeArray<ulong> variants, bool cached,
+                                        ref HotspotCutState state)
+        {
             state.work.Clear();
             var groupOf = state.GroupOf;
             var groups  = state.groups;
@@ -166,21 +201,45 @@ namespace Chisel.Core
                     surfaces[s].hotspot.groupVariations = grouped ? groups[g].info.variations : 0;
                 }
             }
-            var cached = cache.IsCreated;
-            var groupKeys = new NativeArray<uint4>(cached ? groups.Length : 0, Allocator.Temp);
-            var globalKey = default(uint4);
+            state.groupKeys.ResizeUninitialized(cached ? groups.Length : 0);
+            state.globalKey.Value = default;
             if (cached)
             {
                 for (int g = 0; g < groups.Length; g++)
-                    groupKeys[g] = HashGroup(groups[g], state.lines, state.halfPlanes, state.cells);
-                globalKey = HashInputs(layouts, tileSides, variants);
+                    state.groupKeys[g] = HashGroup(groups[g], state.lines, state.halfPlanes, state.cells);
+                state.globalKey.Value = HashInputs(layouts, tileSides, variants);
             }
-            using var rules = new NativeList<HotspotBorderCorner>(4, Allocator.Temp);
+            state.brushKeys.ResizeUninitialized(brushes.Length);
+            state.brushCuts.ResizeUninitialized(brushes.Length);
+        }
+
+        // Whether a brush is cut (0 not, 1 keyed, 2 every time) and its key: what the cut reads, the brush as the weld left
+        // it, its groups, the borders given by hand, the layouts. Each brush is independent of the others.
+        public static byte BrushCutKey(int b, NativeArray<BrushData> brushes, UnsafeHashMap<int2, int> groupOf, UnsafeHashMap<int2, float4x4> unfoldOf,
+                                       in UnsafeParallelMultiHashMap<int2, HotspotBorderCorner> bordersOf, NativeArray<uint4> groupKeys, uint4 globalKey,
+                                       bool cached, out uint4 key)
+        {
+            key = default;
+            if (!brushes[b].brushRenderBuffer.IsCreated ||
+                (!HasSections(ref brushes[b].brushRenderBuffer.Value) && !InGroup(ref brushes[b].brushRenderBuffer.Value, b, groupOf)))
+                return 0;
+            if (!cached)
+                return 2;
+            var rules = new NativeList<HotspotBorderCorner>(4, Allocator.Temp);
+            var keyed = BrushKey(brushes[b].brushRenderBuffer, b, groupOf, unfoldOf, bordersOf, groupKeys, globalKey, rules, out key);
+            rules.Dispose();
+            return (byte)(keyed ? 1 : 2);
+        }
+
+        // The brushes to cut (work): a brush whose key is what it was when the cache kept its cut is given that cut here
+        public static void FinishCutKeys(NativeList<BrushData> brushes, NativeParallelHashMap<CompactNodeID, HotspotCutEntry> cache, ref HotspotCutState state)
+        {
+            var cached = cache.IsCreated;
             for (int b = 0; b < brushes.Length; b++)
             {
                 var nodeID = brushes[b].brushIndexOrder.compactNodeID;
-                if (!brushes[b].brushRenderBuffer.IsCreated ||
-                    (!HasSections(ref brushes[b].brushRenderBuffer.Value) && !InGroup(ref brushes[b].brushRenderBuffer.Value, b, groupOf)))
+                var cut    = state.brushCuts[b];
+                if (cut == 0)
                 {
                     if (cached && cache.TryGetValue(nodeID, out var stale))
                     {
@@ -190,11 +249,8 @@ namespace Chisel.Core
                     }
                     continue;
                 }
-                // what the cut reads: the brush as the weld left it, its groups, the borders given by hand, the layouts
-                var key = default(uint4);
-                var keyed = false;
-                if (cached)
-                    keyed = BrushKey(brushes[b].brushRenderBuffer, b, groupOf, state.UnfoldOf, state.bordersOf, groupKeys, globalKey, rules, out key);
+                var keyed = cut == 1;
+                var key   = state.brushKeys[b];
                 if (keyed && cache.TryGetValue(nodeID, out var entry) && entry.result.IsCreated && entry.key.Equals(key))
                 {
                     entry.used = true;
@@ -206,7 +262,6 @@ namespace Chisel.Core
                 }
                 state.work.Add(new HotspotCutWork { brush = b, key = key, keyed = keyed });
             }
-            groupKeys.Dispose();
         }
 
         // Each group's id (HotspotSurfaceInfo.group): from its first member, so it stays while the group does and what was

@@ -2633,6 +2633,32 @@ namespace Chisel.Core
                         JobHandles.Read(JobHandleType.decalVolumesJobHandle),
                         JobHandles.Write(JobHandleType.brushRenderDataJobHandle));
 
+                    var hotspotCutKeysJob = new HotspotCutKeysJob
+                    {
+                        brushRenderData = Temporaries.brushRenderData.AsDeferredJobArray(),
+                        groupOf         = Temporaries.hotspotCut.groupOfRef,
+                        unfoldOf        = Temporaries.hotspotCut.unfoldOfRef,
+                        bordersOf       = Temporaries.hotspotCut.bordersOf,
+                        groupKeys       = Temporaries.hotspotCut.groupKeys.AsDeferredJobArray(),
+                        globalKey       = Temporaries.hotspotCut.globalKey,
+                        cached          = chiselLookupValues.hotspotCutCache.IsCreated,
+                        brushKeys       = Temporaries.hotspotCut.brushKeys.AsDeferredJobArray(),
+                        brushCuts       = Temporaries.hotspotCut.brushCuts.AsDeferredJobArray()
+                    };
+                    hotspotCutKeysJob.Schedule(runInParallel, Temporaries.brushRenderData, 16,
+                        JobHandles.Read(JobHandleType.decalVolumesJobHandle),
+                        JobHandles.Write(JobHandleType.brushRenderDataJobHandle));
+
+                    var finishHotspotCutKeysJob = new FinishHotspotCutKeysJob
+                    {
+                        brushRenderData = Temporaries.brushRenderData,
+                        hotspotCutCache = chiselLookupValues.hotspotCutCache,
+                        hotspotCut      = Temporaries.hotspotCut
+                    };
+                    finishHotspotCutKeysJob.Schedule(runInParallel,
+                        JobHandles.Read(JobHandleType.decalVolumesJobHandle),
+                        JobHandles.Write(JobHandleType.brushRenderDataJobHandle));
+
                     var cutHotspotBrushesJob = new CutHotspotBrushesJob
                     {
                         // Read

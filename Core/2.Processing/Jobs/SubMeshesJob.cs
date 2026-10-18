@@ -149,12 +149,13 @@ namespace Chisel.Core
         [NoAlias, ReadOnly] public NativeArray<BrushData>              brushRenderData;
         [NoAlias, ReadOnly] public NativeList<OutputModelWeld.Working> work;
         [NoAlias, ReadOnly] public NativeParallelHashMap<long, int>    workIndex;
+        [NoAlias, ReadOnly] public NativeParallelHashMap<CompactNodeID, WeldCopyEntry> weldCopyCache;
 
         [NoAlias] public NativeArray<WeldCopy> copies;
 
         public void Execute(int index)
         {
-            copies[index] = OutputModelWeld.CopyPlanned(copies[index], brushRenderData, work, workIndex);
+            copies[index] = OutputModelWeld.CopyPlanned(copies[index], brushRenderData, work, workIndex, weldCopyCache);
         }
     }
 
@@ -174,6 +175,7 @@ namespace Chisel.Core
         [NoAlias] public NativeList<BlobAssetReference<ChiselBrushRenderBuffer>> patchedRenderBuffers;
         [NoAlias] public HotspotCutState hotspotCut;
         [NoAlias] public FindState       hotspotFind;
+        [NoAlias] public NativeParallelHashMap<CompactNodeID, WeldCopyEntry> weldCopyCache;
 
         public void Execute()
         {
@@ -181,7 +183,7 @@ namespace Chisel.Core
             hotspotCut.kept.Clear();
             for (int i = 0; i < brushRenderData.Length; i++)
                 hotspotCut.kept.Add(brushRenderData[i].brushRenderBuffer);
-            OutputModelWeld.FinishWeld(brushRenderData, patchedRenderBuffers, weldCopies);
+            OutputModelWeld.FinishWeld(brushRenderData, patchedRenderBuffers, weldCopies, weldCopyCache);
             HotspotGroups.Borders(brushRenderData, hotspotLinks, ref hotspotCut.bordersOf);
             HotspotGroups.Prepare(brushRenderData, hotspotTiles, hotspotLayouts, hotspotLinks, ref hotspotFind);
             hotspotFind.inputs.Value = HotspotGroups.InputsKey(hotspotTiles, hotspotLayouts, hotspotTileSides);

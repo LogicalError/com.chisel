@@ -9,7 +9,18 @@ namespace Chisel.Core
     internal struct WeldCopy
     {
         public int brush;
+        public uint4 key;
+        public bool keyed;
+        public bool reused;
         public BlobAssetReference<ChiselBrushRenderBuffer> result;
+    }
+
+    // A brush's welded buffer, with what it was made from
+    internal struct WeldCopyEntry
+    {
+        public uint4 key;
+        public BlobAssetReference<ChiselBrushRenderBuffer> result;
+        public bool used;
     }
 
     // The surfaces the weld changed, kept until their brushes are stored again
@@ -129,8 +140,8 @@ namespace Chisel.Core
                 PlanWeld(brushes, ref state, out split, out paired, out cancelled, out collapsed, moves);
                 var copies = state.copies.AsArray();
                 for (int i = 0; i < copies.Length; i++)
-                    copies[i] = CopyPlanned(copies[i], brushes.AsArray(), state.work, state.workIndex);
-                FinishWeld(brushes, patched, state.copies);
+                    copies[i] = CopyPlanned(copies[i], brushes.AsArray(), state.work, state.workIndex, default);
+                FinishWeld(brushes, patched, state.copies, default);
             }
             finally
             {
@@ -224,25 +235,112 @@ namespace Chisel.Core
             }
         }
 
-        // One changed brush's buffer stored again; each is independent of the others
-        public static WeldCopy CopyPlanned(WeldCopy copy, NativeArray<BrushData> brushes, NativeList<Working> work, NativeParallelHashMap<long, int> workIndex)
+        // One changed brush's buffer stored again, or the one the cache kept when it was made from the same; each is
+        // independent of the others
+        public static WeldCopy CopyPlanned(WeldCopy copy, NativeArray<BrushData> brushes, NativeList<Working> work, NativeParallelHashMap<long, int> workIndex,
+                                           NativeParallelHashMap<CompactNodeID, WeldCopyEntry> cache)
         {
-            copy.result = Copy(brushes[copy.brush].brushRenderBuffer, copy.brush, work, workIndex);
+            var source = brushes[copy.brush].brushRenderBuffer;
+            if (cache.IsCreated)
+            {
+                copy.keyed = CopyKey(source, copy.brush, work, workIndex, out copy.key);
+                if (copy.keyed && cache.TryGetValue(brushes[copy.brush].brushIndexOrder.compactNodeID, out var entry) &&
+                    entry.result.IsCreated && entry.key.Equals(copy.key))
+                {
+                    copy.result = entry.result;
+                    copy.reused = true;
+                    return copy;
+                }
+            }
+            copy.result = Copy(source, copy.brush, work, workIndex);
             return copy;
         }
 
-        // The copies handed to their brushes; patched frees them after the meshes are made
-        public static void FinishWeld(NativeList<BrushData> brushes, NativeList<BlobAssetReference<ChiselBrushRenderBuffer>> patched, NativeList<WeldCopy> copies)
+        // The copies handed to their brushes: kept by the cache, or by patched to be freed after the meshes are made; then
+        // the cache forgets the brushes this update did not weld
+        public static void FinishWeld(NativeList<BrushData> brushes, NativeList<BlobAssetReference<ChiselBrushRenderBuffer>> patched, NativeList<WeldCopy> copies,
+                                      NativeParallelHashMap<CompactNodeID, WeldCopyEntry> cache)
         {
+            var cached = cache.IsCreated;
             for (int i = 0; i < copies.Length; i++)
             {
                 var copy = copies[i];
-                patched.Add(copy.result);
+                if (cached && copy.keyed)
+                {
+                    var nodeID = brushes[copy.brush].brushIndexOrder.compactNodeID;
+                    if (!copy.reused && cache.TryGetValue(nodeID, out var old) && old.result.IsCreated)
+                        old.result.Dispose();
+                    cache[nodeID] = new WeldCopyEntry { key = copy.key, result = copy.result, used = true };
+                }
+                else
+                    patched.Add(copy.result);
                 var data = brushes[copy.brush];
                 data.brushRenderBuffer = copy.result;
                 brushes[copy.brush] = data;
             }
+            if (!cached)
+                return;
+            using var gone = new NativeList<CompactNodeID>(Allocator.Temp);
+            foreach (var pair in cache)
+            {
+                if (!pair.Value.used)
+                    gone.Add(pair.Key);
+            }
+            foreach (var id in gone)
+            {
+                if (cache.TryGetValue(id, out var dead) && dead.result.IsCreated)
+                    dead.result.Dispose();
+                cache.Remove(id);
+            }
+            using var left = cache.GetKeyArray(Allocator.Temp);
+            foreach (var id in left)
+            {
+                var entry = cache[id];
+                entry.used = false;
+                cache[id] = entry;
+            }
         }
+
+        // What Copy reads for a brush: its buffer and the weld's working copies of its surfaces
+        static unsafe bool CopyKey(BlobAssetReference<ChiselBrushRenderBuffer> source, int brush, NativeList<Working> work,
+                                   NativeParallelHashMap<long, int> workIndex, out uint4 key)
+        {
+            key = default;
+            if (!source.IsCreated)
+                return false;
+            var data   = (byte*)source.GetUnsafePtr();
+            var length = *(int*)(data - 32 + 8);
+            if (length <= 0 || length >= (1 << 30))
+                return false;
+            var buffer = new UnsafeAppendBuffer(256, 16, Allocator.Temp);
+            try
+            {
+                buffer.Add(xxHash3.Hash128(data, length));
+                ref var surfaces = ref source.Value.surfaces;
+                for (int s = 0; s < surfaces.Length; s++)
+                {
+                    var w = Find(workIndex, brush, s);
+                    if (w < 0)
+                        continue;
+                    var item = work[w];
+                    buffer.Add(s);
+                    buffer.Add(item.indices.Length);
+                    buffer.Add(item.collider.Length);
+                    buffer.Add(HashOf(item.indices.Ptr,  (long)item.indices.Length  * sizeof(int)));
+                    buffer.Add(HashOf(item.collider.Ptr, (long)item.collider.Length * sizeof(float3)));
+                    buffer.Add(HashOf(item.select.Ptr,   (long)item.select.Length   * UnsafeUtility.SizeOf<SelectVertex>()));
+                    buffer.Add(HashOf(item.render.Ptr,   (long)item.render.Length   * UnsafeUtility.SizeOf<RenderVertex>()));
+                }
+                key = xxHash3.Hash128(buffer.Ptr, buffer.Length);
+                return true;
+            }
+            finally
+            {
+                buffer.Dispose();
+            }
+        }
+
+        static unsafe uint4 HashOf(void* data, long length) { return length == 0 ? default : xxHash3.Hash128(data, length); }
 
         // One pass over the needles; true when it dropped one
         static bool WeldNeedles(NativeList<BrushData> brushes, NativeArray<MinMaxAABB> bounds, NativeList<Needle> needles,

@@ -153,6 +153,7 @@ namespace Chisel.Core
             state.work.Clear();
             var groupOf = state.GroupOf;
             var groups  = state.groups;
+            StableGroupIds(brushes, groupOf, groups);
             for (int b = 0; kept.IsCreated && b < kept.Length && b < brushes.Length; b++)
             {
                 if (!kept[b].IsCreated)
@@ -161,7 +162,7 @@ namespace Chisel.Core
                 for (int s = 0; s < surfaces.Length; s++)
                 {
                     var grouped = groupOf.TryGetValue(new int2(b, s), out var g);
-                    surfaces[s].hotspot.group           = grouped ? g + 1 : 0;
+                    surfaces[s].hotspot.group           = grouped ? groups[g].info.group : 0;
                     surfaces[s].hotspot.groupVariations = grouped ? groups[g].info.variations : 0;
                 }
             }
@@ -206,6 +207,30 @@ namespace Chisel.Core
                 state.work.Add(new HotspotCutWork { brush = b, key = key, keyed = keyed });
             }
             groupKeys.Dispose();
+        }
+
+        // Each group's id (HotspotSurfaceInfo.group): from its first member, so it stays while the group does and what was
+        // made from the group is the same again
+        static void StableGroupIds(NativeList<BrushData> brushes, UnsafeHashMap<int2, int> groupOf, NativeList<HotspotGroups.Group> groups)
+        {
+            var lowest = new NativeArray<uint>(groups.Length, Allocator.Temp);
+            for (int g = 0; g < lowest.Length; g++)
+                lowest[g] = uint.MaxValue;
+            foreach (var pair in groupOf)
+            {
+                var b = pair.Key.x;
+                if (b < 0 || b >= brushes.Length || pair.Value < 0 || pair.Value >= groups.Length)
+                    continue;
+                var id = math.hash(new int2(brushes[b].brushIndexOrder.compactNodeID.GetHashCode(), pair.Key.y));
+                lowest[pair.Value] = math.min(lowest[pair.Value], id);
+            }
+            for (int g = 0; g < groups.Length; g++)
+            {
+                var group = groups[g];
+                group.info.group = (int)((lowest[g] >> 1) | 1);
+                groups[g] = group;
+            }
+            lowest.Dispose();
         }
 
         // One planned brush cut; each is independent of the others, so they can be cut at the same time
@@ -579,7 +604,6 @@ namespace Chisel.Core
                 to.CopySections(builder, ref from);
                 to.sectionInput = group.input;
                 to.hotspot      = group.info;
-                to.hotspot.group = groupIndex + 1;
                 to.hotspot.repeats = laid;
                 if (limited)
                     to.hotspot.flags |= HotspotSurfaceFlags.BudgetLimited;

@@ -2487,6 +2487,7 @@ namespace Chisel.Core
                         brushRenderData = Temporaries.brushRenderData.AsDeferredJobArray(),
                         work            = Temporaries.weld.work,
                         workIndex       = Temporaries.weld.workIndex,
+                        weldCopyCache   = chiselLookupValues.weldCopyCache,
 
                         // Write
                         copies          = Temporaries.weld.copies.AsDeferredJobArray()
@@ -2508,7 +2509,8 @@ namespace Chisel.Core
                         brushRenderData      = Temporaries.brushRenderData,
                         patchedRenderBuffers = Temporaries.patchedRenderBuffers,
                         hotspotCut           = Temporaries.hotspotCut,
-                        hotspotFind          = Temporaries.hotspotFind
+                        hotspotFind          = Temporaries.hotspotFind,
+                        weldCopyCache        = chiselLookupValues.weldCopyCache
                     };
                     prepareHotspotGroupsJob.Schedule(runInParallel,
                         JobHandles.Read(JobHandleType.decalVolumesJobHandle),

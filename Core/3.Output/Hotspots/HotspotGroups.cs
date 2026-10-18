@@ -433,11 +433,12 @@ namespace Chisel.Core
             var sliverTo = new NativeArray<float2>(candidates.Length - firstSliver, Allocator.Temp);
             for (int i = 0; i < sliverTo.Length; i++)
                 sliverTo[i] = new float2(-1, 0);
-            using (var pairs = shared.GetKeyArray(Allocator.Temp))
+            using (var sharedPairs = shared.GetKeyValueArrays(Allocator.Temp))
             {
+                var pairs = sharedPairs.Keys;
                 for (int i = 0; i < pairs.Length; i++)
                 {
-                    if (shared[pairs[i]] < 2)
+                    if (sharedPairs.Values[i] < 2)
                         continue;
                     var a = SourceOf(brushes, candidates[pairs[i].x]);
                     var b = SourceOf(brushes, candidates[pairs[i].y]);

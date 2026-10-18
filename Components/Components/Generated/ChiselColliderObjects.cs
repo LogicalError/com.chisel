@@ -18,6 +18,7 @@ namespace Chisel.Components
     public class ChiselColliderObjects
     {
         public ulong            surfaceParameter;
+        public uint             chunk;
         public Mesh             sharedMesh;
         public MeshCollider     meshCollider;
         public PhysicsMaterial  physicsMaterial;
@@ -25,7 +26,7 @@ namespace Chisel.Components
         public uint             geometryHashValue;
 
         private ChiselColliderObjects() { }
-        public static ChiselColliderObjects Create(GameObject container, ulong surfaceParameter)
+        public static ChiselColliderObjects Create(GameObject container, ulong surfaceParameter, uint chunk)
         {
             var physicsMaterial = surfaceParameter == 0 ? null : Resources.EntityIdToObject(UnityEngine.EntityId.FromULong(surfaceParameter)) as PhysicsMaterial;
             var sharedMesh      = new Mesh { name = ChiselGeneratedObjects.kGeneratedMeshColliderName };
@@ -33,6 +34,7 @@ namespace Chisel.Components
             var colliderObjects = new ChiselColliderObjects
             {
                 surfaceParameter    = surfaceParameter,
+                chunk               = chunk,
                 meshCollider        = meshCollider,
                 physicsMaterial     = physicsMaterial,
                 sharedMesh          = sharedMesh

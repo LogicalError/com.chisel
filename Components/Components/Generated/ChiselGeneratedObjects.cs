@@ -604,6 +604,13 @@ namespace Chisel.Components
                 Profiler.EndSample();
 
                 Profiler.BeginSample("new_ChiselPhysicsObjectUpdate");
+                // the existing colliders by physics material and chunk
+                var colliderOf = new System.Collections.Generic.Dictionary<(ulong, uint), int>(colliders.Length);
+                for (int j = 0; j < colliders.Length; j++)
+                {
+                    if (colliders[j] != null)
+                        colliderOf.TryAdd((colliders[j].surfaceParameter, colliders[j].chunk), j);
+                }
                 for (int i = 0; i < meshUpdates.meshUpdatesColliders.Length; i++)
                 {
                     var colliderMeshUpdate = meshUpdates.meshUpdatesColliders[i];
@@ -611,22 +618,15 @@ namespace Chisel.Components
                     var surfaceParameter = colliderMeshUpdate.objectIndex;
                     var colliderIndex = colliderMeshUpdate.colliderIndex;
 
-                    // TODO: optimize
-                    for (int j = 0; j < colliders.Length; j++)
+                    if (colliderOf.Remove((surfaceParameter, colliderMeshUpdate.chunk), out var existing))
                     {
-                        if (colliders[j] == null)
-                            continue;
-                        if (colliders[j].surfaceParameter != surfaceParameter)
-                            continue;
-
-                        colliderObjects[colliderIndex] = colliders[j];
-                        colliders[j] = null;
-                        break;
+                        colliderObjects[colliderIndex] = colliders[existing];
+                        colliders[existing] = null;
                     }
 
                     Profiler.BeginSample("Create.Colliders");
                     if (colliderObjects[colliderIndex] == null)
-                        colliderObjects[colliderIndex] = ChiselColliderObjects.Create(colliderContainer, surfaceParameter);
+                        colliderObjects[colliderIndex] = ChiselColliderObjects.Create(colliderContainer, surfaceParameter, colliderMeshUpdate.chunk);
                     Profiler.EndSample();
 
                     var instance = colliderObjects[colliderIndex];
@@ -648,12 +648,9 @@ namespace Chisel.Components
                 {
                     foreach (var keptUpdate in meshUpdates.meshUpdatesKeptColliders)
                     {
-                        var found = -1;
-                        for (int j = 0; j < colliders.Length && found < 0; j++)
-                        {
-                            if (colliders[j] != null && colliders[j].surfaceParameter == keptUpdate.objectIndex && colliders[j].IsValid())
-                                found = j;
-                        }
+                        if (!colliderOf.Remove((keptUpdate.objectIndex, keptUpdate.chunk), out var found) ||
+                            colliders[found] == null || !colliders[found].IsValid())
+                            found = -1;
                         if (found < 0)
                         {
                             ChiselNodeHierarchyManager.RebuildTreeNodes(model);

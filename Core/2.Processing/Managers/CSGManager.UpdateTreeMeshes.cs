@@ -2744,7 +2744,7 @@ namespace Chisel.Core
                                 buffer.Add(surfaces[s].brushRenderBuffer.Value.surfaces[surfaces[s].surfaceIndex].shapeHashValue);
                         }
                         var hash = xxHash3.Hash128(buffer.Ptr, buffer.Length);
-                        var key  = new RenderMeshKey { query = (int)section.meshQuery.LayerQuery, surfaceParameter = description.surfaceParameter };
+                        var key  = new RenderMeshKey { query = (int)section.meshQuery.LayerQuery, surfaceParameter = description.surfaceParameter, chunk = description.chunk };
                         if (!seen.Add(key))
                             continue;
                         if (hashes.TryGetValue(key, out var last) && last.Equals(hash))

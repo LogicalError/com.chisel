@@ -26,19 +26,22 @@ namespace Chisel.Core
         public ulong objectIndex;
         // a render mesh's material (each material is a mesh of its own)
         public ulong surfaceParameter;
+        // a collider's chunk of space
+        public uint  chunk;
         // what a render mesh's lightmap layout is made from: its baked lightmap stays valid while this does
         public uint  lightmapHashValue;
         public ChiselMeshType type;
         public SubMeshSection subMeshSection;
 	}
     
-    // A render mesh of a tree: its query and its material
+    // A mesh of a tree: its query, its material and, for a collider, its chunk
     public struct RenderMeshKey : System.IEquatable<RenderMeshKey>
     {
         public int   query;
         public ulong surfaceParameter;
-        public bool Equals(RenderMeshKey other) => query == other.query && surfaceParameter == other.surfaceParameter;
-        public override int GetHashCode() => (int)Unity.Mathematics.math.hash(new Unity.Mathematics.uint3((uint)query, (uint)surfaceParameter, (uint)(surfaceParameter >> 32)));
+        public uint  chunk;
+        public bool Equals(RenderMeshKey other) => query == other.query && surfaceParameter == other.surfaceParameter && chunk == other.chunk;
+        public override int GetHashCode() => (int)Unity.Mathematics.math.hash(new Unity.Mathematics.uint4((uint)query, (uint)surfaceParameter, (uint)(surfaceParameter >> 32), chunk));
     }
 
     [BurstCompile(CompileSynchronously = true)]
@@ -177,6 +180,7 @@ namespace Chisel.Core
                         continue;
 
                     var surfaceParameter = meshDescriptions[subMeshSection.startIndex].surfaceParameter;
+                    var chunk            = meshDescriptions[subMeshSection.startIndex].chunk;
                     if (keptSections.IsCreated && i < keptSections.Length && keptSections[i])
                     {
                         meshUpdatesKeptColliders.Add(new ChiselMeshUpdate
@@ -185,6 +189,7 @@ namespace Chisel.Core
                             colliderIndex  = -1,
                             meshIndex      = -1,
                             objectIndex    = surfaceParameter,
+                            chunk          = chunk,
                             type           = ChiselMeshType.Collider,
                             subMeshSection = subMeshSection
                         });
@@ -196,6 +201,7 @@ namespace Chisel.Core
                         colliderIndex  = colliderIndex,
                         meshIndex      = meshIndex,
                         objectIndex    = surfaceParameter,
+                        chunk          = chunk,
                         type           = ChiselMeshType.Collider,
 						subMeshSection = subMeshSection
 					};

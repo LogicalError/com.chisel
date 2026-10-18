@@ -1,3 +1,4 @@
+using System;
 using Unity.Burst;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
@@ -16,6 +17,7 @@ namespace Chisel.Core
         public int meshQueryIndex;
         public int subMeshQueryIndex;
         public ulong surfaceParameter;
+        public uint  chunk;
             
         public int surfacesOffset;
         public int surfacesCount;
@@ -32,6 +34,7 @@ namespace Chisel.Core
 		public CompactNodeID brushNodeID;
 		public int surfaceIndex;
 		public ulong surfaceParameter;
+		public uint  chunk;
 
 		public int vertexCount;
 		public int indexCount;
@@ -39,6 +42,20 @@ namespace Chisel.Core
 		public uint geometryHashValue;
 		public uint surfaceHashValue;
 		public BlobAssetReference<ChiselBrushRenderBuffer> brushRenderBuffer;
+	}
+
+	// What a query's surfaces are grouped by: their parameter, and for a collider the chunk of space its brush is in
+	struct SurfaceGroupKey : IComparable<SurfaceGroupKey>
+	{
+		public ulong parameter;
+		public uint  chunk;
+		public int CompareTo(SurfaceGroupKey other)
+		{
+			if (parameter != other.parameter) return parameter < other.parameter ? -1 : 1;
+			if (chunk != other.chunk) return chunk < other.chunk ? -1 : 1;
+			return 0;
+		}
+		public bool Equals(SurfaceGroupKey other) => parameter == other.parameter && chunk == other.chunk;
 	}
 
 	struct BrushData
@@ -304,20 +321,30 @@ namespace Chisel.Core
 
             var subMeshSurfaceList = new UnsafeList<SubMeshSurface>(math.max(1, requiredSurfaceCount), allocator);
 
+            // A collider is a mesh per physics material and chunk, so a change rebakes only the chunks it touched
+            var chunked = meshQueries[t].LayerParameterIndex == SurfaceParameterIndex.PhysicsMaterial;
+            var brushChunks = new NativeArray<uint>(math.max(1, brushRenderData.Length), Allocator.Temp);
+            if (chunked)
+            {
+                for (int b = 0, count_b = brushRenderData.Length; b < count_b; b++)
+                    brushChunks[b] = ChunkOf(ref brushRenderData[b].brushRenderBuffer.Value);
+            }
+
             // One key per surface of this query. Sorted, this both yields the distinct parameters and
             // counts each group's surfaces, so the per-brush blobs are walked twice, not three times.
-            var parameters = new NativeList<ulong>(math.max(1, requiredSurfaceCount), Allocator.Temp);
+            var parameters = new NativeList<SurfaceGroupKey>(math.max(1, requiredSurfaceCount), Allocator.Temp);
             for (int b = 0, count_b = brushRenderData.Length; b < count_b; b++)
             {
                 ref var surfaces = ref brushRenderData[b].brushRenderBuffer.Value.querySurfaces[t].surfaces;
                 for (int s = 0; s < surfaces.Length; s++)
-                    parameters.AddNoResize(surfaces[s].surfaceParameter);
+                    parameters.AddNoResize(new SurfaceGroupKey { parameter = surfaces[s].surfaceParameter, chunk = brushChunks[b] });
             }
             var surfaceCount = parameters.Length;
             subMeshSurfaceList.Resize(surfaceCount, NativeArrayOptions.UninitializedMemory);
             if (surfaceCount == 0)
             {
                 parameters.Dispose();
+                brushChunks.Dispose();
                 subMeshSurfaces[t] = subMeshSurfaceList;
                 return;
             }
@@ -329,7 +356,7 @@ namespace Chisel.Core
             int uniqueCount = 0;
             for (int i = 0; i < surfaceCount; i++)
             {
-                if (uniqueCount == 0 || parameters[uniqueCount - 1] != parameters[i])
+                if (uniqueCount == 0 || !parameters[uniqueCount - 1].Equals(parameters[i]))
                 {
                     parameters[uniqueCount++] = parameters[i];
                     groupOffsets.AddNoResize(i);
@@ -348,7 +375,7 @@ namespace Chisel.Core
 
                 for (int s = 0; s < surfaces.Length; s++)
                 {
-                    var group = FindGroup(parameters, surfaces[s].surfaceParameter);
+                    var group = FindGroup(parameters, new SurfaceGroupKey { parameter = surfaces[s].surfaceParameter, chunk = brushChunks[b] });
                     var index = groupOffsets[group];
                     groupOffsets[group] = index + 1;
                     subMeshSurfaceList[index] = new SubMeshSurface
@@ -356,6 +383,7 @@ namespace Chisel.Core
                         brushNodeID       = brushNodeID,
                         surfaceIndex      = surfaces[s].surfaceIndex,
                         surfaceParameter  = surfaces[s].surfaceParameter,
+                        chunk             = brushChunks[b],
                         vertexCount       = surfaces[s].vertexCount,
                         indexCount        = surfaces[s].indexCount,
                         surfaceHashValue  = surfaces[s].surfaceHashValue,
@@ -366,18 +394,40 @@ namespace Chisel.Core
             }
             groupOffsets.Dispose();
             parameters.Dispose();
+            brushChunks.Dispose();
 
             subMeshSurfaces[t] = subMeshSurfaceList;
         }
 
+        const float kChunkSize = 16.0f;
+
+        // The cell of space a brush's output is centred in
+        static uint ChunkOf(ref ChiselBrushRenderBuffer brushRenderBuffer)
+        {
+            ref var surfaces = ref brushRenderBuffer.surfaces;
+            var min = new float3(float.PositiveInfinity);
+            var max = new float3(float.NegativeInfinity);
+            for (int s = 0; s < surfaces.Length; s++)
+            {
+                if (surfaces[s].indexCount == 0)
+                    continue;
+                min = math.min(min, surfaces[s].aabb.Min);
+                max = math.max(max, surfaces[s].aabb.Max);
+            }
+            if (math.any(min > max))
+                return 0;
+            var cell = (int3)math.floor((min + max) * (0.5f / kChunkSize));
+            return math.hash(cell);
+        }
+
         // Index of `value` in the sorted, distinct `parameters` (every value looked up came from it)
-        static int FindGroup(in NativeList<ulong> parameters, ulong value)
+        static int FindGroup(in NativeList<SurfaceGroupKey> parameters, SurfaceGroupKey value)
         {
             int lo = 0, hi = parameters.Length - 1;
             while (lo < hi)
             {
                 var mid = (lo + hi) >> 1;
-                if (parameters[mid] < value) lo = mid + 1; else hi = mid;
+                if (parameters[mid].CompareTo(value) < 0) lo = mid + 1; else hi = mid;
             }
             return lo;
         }
@@ -419,7 +469,8 @@ namespace Chisel.Core
                 subMeshQueryIndex   = 0,
                 meshQuery           = meshQuery,
                 surfacesOffset      = 0,
-                surfaceParameter    = subMeshSurfaceList[0].surfaceParameter
+                surfaceParameter    = subMeshSurfaceList[0].surfaceParameter,
+                chunk               = subMeshSurfaceList[0].chunk
             };
             for (int b = 0; b < surfaceCount; b++)
             {
@@ -428,7 +479,7 @@ namespace Chisel.Core
                 var surfaceVertexCount          = subMeshSurface.vertexCount;
                 var surfaceIndexCount           = subMeshSurface.indexCount;
 
-                if (currentSubMesh.surfaceParameter != surfaceParameter)
+                if (currentSubMesh.surfaceParameter != surfaceParameter || currentSubMesh.chunk != subMeshSurface.chunk)
                 {
                     // Store the previous subMeshCount
                     if (currentSubMesh.indexCount > 0 && currentSubMesh.vertexCount > 0)
@@ -444,6 +495,7 @@ namespace Chisel.Core
 					currentSubMesh.surfacesOffset += currentSubMesh.surfacesCount;
 					currentSubMesh.surfacesCount = 0;
                     currentSubMesh.surfaceParameter = surfaceParameter;
+                    currentSubMesh.chunk = subMeshSurface.chunk;
                     currentSubMesh.subMeshQueryIndex++;
                 } 
 
@@ -598,6 +650,7 @@ namespace Chisel.Core
                 {
                     meshQuery           = subMesh.meshQuery,
                     surfaceParameter    = subMesh.surfaceParameter,
+                    chunk               = subMesh.chunk,
                     meshQueryIndex      = subMesh.meshQueryIndex,
                     subMeshQueryIndex   = subMesh.subMeshQueryIndex,
 

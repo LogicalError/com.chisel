@@ -54,6 +54,8 @@ namespace Chisel.Core
             // What the hotspot cut made of each brush's surfaces, kept while its inputs stay the same (OutputHotspotSections.CutModel)
             public NativeParallelHashMap<CompactNodeID, HotspotCutEntry>        hotspotCutCache;
             public NativeParallelHashMap<CompactNodeID, WeldCopyEntry>          weldCopyCache;
+            // what the last update's hotspot grouping found (HotspotGroups.PrepareIncremental)
+            public HotspotGroupMemory                                          hotspotGroupMemory;
             // What each group of hotspot surfaces was matched with, by what it was made from (HotspotGroups.Match)
             public NativeParallelHashMap<uint4, GroupMatchEntry>               hotspotMatchCache;
             // What each render mesh was last made from, by (query, material): a mesh made from the same is kept
@@ -86,6 +88,7 @@ namespace Chisel.Core
 				collapseMoves               = new NativeList<float3x2>(4, Allocator.Persistent);
 				hotspotCutCache             = new NativeParallelHashMap<CompactNodeID, HotspotCutEntry>(16, Allocator.Persistent);
 				weldCopyCache               = new NativeParallelHashMap<CompactNodeID, WeldCopyEntry>(16, Allocator.Persistent);
+				hotspotGroupMemory          = HotspotGroupMemory.Create(Allocator.Persistent);
 				hotspotMatchCache           = new NativeParallelHashMap<uint4, GroupMatchEntry>(16, Allocator.Persistent);
 				renderMeshHashes            = new NativeParallelHashMap<RenderMeshKey, uint4>(16, Allocator.Persistent);
 				decalTargets                = new NativeList<ChiselDecalTarget>(16, Allocator.Persistent);
@@ -304,6 +307,8 @@ namespace Chisel.Core
                     weldCopyCache.Dispose();
                 }
                 weldCopyCache = default;
+                hotspotGroupMemory.Dispose();
+                hotspotGroupMemory = default;
                 if (hotspotMatchCache.IsCreated)
                 {
                     foreach (var entry in hotspotMatchCache)

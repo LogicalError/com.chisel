@@ -355,11 +355,22 @@ namespace Chisel.Core
         [NoAlias] public NativeList<BrushData> brushRenderData;
         [NoAlias] public HotspotCutState hotspotCut;
         [NoAlias] public FindState       hotspotFind;
+        // what the last update's grouping found, kept with the tree
+        [NoAlias] public HotspotGroupMemory hotspotGroupMemory;
+        public bool verify;
 
         public void Execute()
         {
             HotspotGroups.Borders(brushRenderData, hotspotLinks, ref hotspotCut.bordersOf);
-            HotspotGroups.Prepare(brushRenderData, hotspotTiles, hotspotLayouts, hotspotLinks, ref hotspotFind);
+            HotspotGroups.PrepareIncremental(brushRenderData, hotspotTiles, hotspotLayouts, hotspotLinks, ref hotspotFind, ref hotspotGroupMemory);
+            if (verify)
+            {
+                var full = FindState.Create(Allocator.Temp);
+                HotspotGroups.Prepare(brushRenderData, hotspotTiles, hotspotLayouts, hotspotLinks, ref full);
+                if (!HotspotGroups.SameAs(hotspotFind, full, out var difference))
+                    Debug.LogError($"Incremental hotspot groups differ from the full grouping ({hotspotGroupMemory.lastDirty.Value} dirty, full: {hotspotGroupMemory.lastFull.Value}): {difference}");
+                full.Dispose();
+            }
             hotspotFind.inputs.Value = HotspotGroups.InputsKey(hotspotTiles, hotspotLayouts, hotspotTileSides);
         }
     }
@@ -394,11 +405,12 @@ namespace Chisel.Core
         [NoAlias, ReadOnly] public NativeArray<BrushData>         brushRenderData;
         [NoAlias, ReadOnly] public NativeArray<HotspotLayoutData> hotspotLayouts;
         [NoAlias, ReadOnly] public NativeArray<int>               kindStart;
-        [NativeDisableParallelForRestriction] [NoAlias] public NativeArray<byte> kinds;
+        [NativeDisableParallelForRestriction] [NoAlias] public NativeArray<byte>  kinds;
+        [NativeDisableParallelForRestriction] [NoAlias] public NativeArray<uint4> hashes;
 
         public void Execute(int b)
         {
-            HotspotGroups.KindsOf(b, brushRenderData, hotspotLayouts, kindStart, kinds);
+            HotspotGroups.KindsOf(b, brushRenderData, hotspotLayouts, kindStart, kinds, hashes);
         }
     }
 

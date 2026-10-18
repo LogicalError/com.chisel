@@ -57,6 +57,8 @@ namespace Chisel.Core
         // (StartKinds, KindsOf): kinds from kindStart[brush]
         public NativeList<int>  kindStart;
         public NativeList<byte> kinds;
+        // and what of each candidate grouping reads (HotspotGroups.SurfaceHash), next to its kind
+        public NativeList<uint4> hashes;
 
         public static FindState Create(Allocator allocator)
         {
@@ -70,7 +72,8 @@ namespace Chisel.Core
                 matches     = new NativeList<GroupMatch>(16, allocator),
                 inputs      = new NativeReference<uint4>(allocator),
                 kindStart   = new NativeList<int>(64, allocator),
-                kinds       = new NativeList<byte>(64, allocator)
+                kinds       = new NativeList<byte>(64, allocator),
+                hashes      = new NativeList<uint4>(64, allocator)
             };
         }
 
@@ -100,13 +103,14 @@ namespace Chisel.Core
             if (inputs.IsCreated)      inputs.Dispose();
             if (kindStart.IsCreated)   kindStart.Dispose();
             if (kinds.IsCreated)       kinds.Dispose();
+            if (hashes.IsCreated)      hashes.Dispose();
         }
 
         public Unity.Jobs.JobHandle Dispose(Unity.Jobs.JobHandle dependency)
         {
             if (matches.IsCreated)
                 dependency = Unity.Jobs.IJobExtensions.Schedule(new FreeGroupMatchesJob { matches = matches }, dependency);
-            var handles = new NativeArray<Unity.Jobs.JobHandle>(9, Allocator.Temp);
+            var handles = new NativeArray<Unity.Jobs.JobHandle>(10, Allocator.Temp);
             for (int i = 0; i < handles.Length; i++)
                 handles[i] = dependency;
             if (matches.IsCreated)     handles[0] = matches.Dispose(dependency);
@@ -118,9 +122,96 @@ namespace Chisel.Core
             if (inputs.IsCreated)      handles[6] = inputs.Dispose(dependency);
             if (kindStart.IsCreated)   handles[7] = kindStart.Dispose(dependency);
             if (kinds.IsCreated)       handles[8] = kinds.Dispose(dependency);
+            if (hashes.IsCreated)      handles[9] = hashes.Dispose(dependency);
             var all = Unity.Jobs.JobHandle.CombineDependencies(handles);
             handles.Dispose();
             return all;
+        }
+    }
+
+    // A surface of the tree, by its brush and its index: what a kept grouping is kept by
+    internal struct SurfaceKey : System.IEquatable<SurfaceKey>
+    {
+        public CompactNodeID brush;
+        public int surface;
+        public readonly bool Equals(SurfaceKey other) => brush == other.brush && surface == other.surface;
+        public override readonly int GetHashCode() => (int)math.hash(new uint2(brush.Hash(), (uint)surface));
+    }
+
+    // A candidate as the last update grouped it
+    internal struct KeptCandidate
+    {
+        public uint4 hash;
+        public SurfaceKey lead;
+        public float4x4 unfold;
+        // its corners, each once (as grouping compares them: + 0.0f)
+        public UnsafeList<float3> corners;
+    }
+
+    // What the last update's grouping found (HotspotGroups.PrepareIncremental), kept with the tree so the next one groups
+    // again only what its edits can have changed (IncrementalHotspotGroups.md)
+    internal struct HotspotGroupMemory
+    {
+        public NativeParallelHashMap<SurfaceKey, KeptCandidate> candidates;
+        // each corner of a candidate -> the candidates that have it
+        public NativeParallelMultiHashMap<float3, SurfaceKey> cornerIndex;
+        // the lead of each group of two or more -> its members (the lead among them)
+        public NativeParallelMultiHashMap<SurfaceKey, SurfaceKey> members;
+        // the brushes, in order; what every candidate's grouping reads (GroupInputsKey)
+        public NativeList<CompactNodeID> order;
+        public NativeReference<uint4> inputs;
+        public NativeReference<bool> valid;
+        // what the last update did: grouped everything again (full), or this many candidates (dirty)
+        public NativeReference<bool> lastFull;
+        public NativeReference<int> lastDirty;
+
+        public static HotspotGroupMemory Create(Allocator allocator)
+        {
+            return new HotspotGroupMemory
+            {
+                candidates  = new NativeParallelHashMap<SurfaceKey, KeptCandidate>(64, allocator),
+                cornerIndex = new NativeParallelMultiHashMap<float3, SurfaceKey>(256, allocator),
+                members     = new NativeParallelMultiHashMap<SurfaceKey, SurfaceKey>(64, allocator),
+                order       = new NativeList<CompactNodeID>(64, allocator),
+                inputs      = new NativeReference<uint4>(allocator),
+                valid       = new NativeReference<bool>(allocator),
+                lastFull    = new NativeReference<bool>(allocator),
+                lastDirty   = new NativeReference<int>(allocator)
+            };
+        }
+
+        public void Clear()
+        {
+            foreach (var pair in candidates)
+            {
+                if (pair.Value.corners.IsCreated)
+                    pair.Value.corners.Dispose();
+            }
+            candidates.Clear();
+            cornerIndex.Clear();
+            members.Clear();
+            order.Clear();
+            valid.Value = false;
+        }
+
+        public void Dispose()
+        {
+            if (candidates.IsCreated)
+            {
+                foreach (var pair in candidates)
+                {
+                    if (pair.Value.corners.IsCreated)
+                        pair.Value.corners.Dispose();
+                }
+                candidates.Dispose();
+            }
+            if (cornerIndex.IsCreated) cornerIndex.Dispose();
+            if (members.IsCreated)     members.Dispose();
+            if (order.IsCreated)       order.Dispose();
+            if (inputs.IsCreated)      inputs.Dispose();
+            if (valid.IsCreated)       valid.Dispose();
+            if (lastFull.IsCreated)    lastFull.Dispose();
+            if (lastDirty.IsCreated)   lastDirty.Dispose();
         }
     }
 
@@ -140,6 +231,9 @@ namespace Chisel.Core
     // neighbour it shares its longest edge with.
     internal static class HotspotGroups
     {
+        // Every update also groups everything again (Prepare) and logs where the incremental result differs
+        public static bool VerifyIncremental;
+
         // Normals and frames agree this closely (the cosine), and the surfaces share at least two corners
         const float kSameDirection = 1 - 1e-6f;
         // A corner two members have, unfolded by each, is one point when they put it this close (squared)
@@ -296,16 +390,48 @@ namespace Chisel.Core
             }
             state.kindStart[brushes.Length] = total;
             state.kinds.ResizeUninitialized(total);
+            state.hashes.ResizeUninitialized(total);
         }
 
-        // The kinds of a brush's surfaces (KindOf); each brush is independent of the others
-        public static void KindsOf(int b, NativeArray<BrushData> brushes, NativeArray<HotspotLayoutData> layouts, NativeArray<int> kindStart, NativeArray<byte> kinds)
+        // The kinds of a brush's surfaces (KindOf), and the hashes of its candidates (SurfaceHash); each brush is independent
+        // of the others
+        public static void KindsOf(int b, NativeArray<BrushData> brushes, NativeArray<HotspotLayoutData> layouts, NativeArray<int> kindStart, NativeArray<byte> kinds,
+                                   NativeArray<uint4> hashes)
         {
             if (!brushes[b].brushRenderBuffer.IsCreated)
                 return;
             ref var surfaces = ref brushes[b].brushRenderBuffer.Value.surfaces;
             for (int s = 0; s < surfaces.Length; s++)
-                kinds[kindStart[b] + s] = KindOf(ref surfaces[s], layouts);
+            {
+                var kind = KindOf(ref surfaces[s], layouts);
+                kinds[kindStart[b] + s]  = kind;
+                hashes[kindStart[b] + s] = kind == 0 ? default : SurfaceHash(ref surfaces[s], kind);
+            }
+        }
+
+        // What grouping reads of a candidate that is its own: its kind, its frame and settings, its corners
+        public static unsafe uint4 SurfaceHash(ref ChiselSurfaceRenderBuffer surface, byte kind)
+        {
+            var source = surface.hotspotSource;
+            var buffer = new UnsafeAppendBuffer(128, 16, Allocator.Temp);
+            buffer.Add(kind);
+            buffer.Add(source.layout); buffer.Add(source.right); buffer.Add(source.up); buffer.Add(source.normal);
+            buffer.Add(source.seed); buffer.Add(source.pinned); buffer.Add(source.pinnedSheet); buffer.Add(source.density);
+            buffer.Add(source.offset); buffer.Add(source.world ? 1 : 0);
+            buffer.Add(surface.colliderVertices.Length);
+            buffer.Add(surface.colliderVertices.Length == 0 ? default : xxHash3.Hash128(surface.colliderVertices.GetUnsafePtr(), (long)surface.colliderVertices.Length * UnsafeUtility.SizeOf<float3>()));
+            var hash = xxHash3.Hash128(buffer.Ptr, buffer.Length);
+            buffer.Dispose();
+            return hash;
+        }
+
+        // What every candidate's grouping reads: the layouts and the links
+        public static unsafe uint4 GroupInputsKey(NativeArray<HotspotLayoutData> layouts, NativeArray<HotspotLink> links)
+        {
+            var parts = stackalloc uint4[2];
+            parts[0] = layouts.IsCreated && layouts.Length > 0 ? xxHash3.Hash128(layouts.GetUnsafeReadOnlyPtr(), (long)layouts.Length * UnsafeUtility.SizeOf<HotspotLayoutData>()) : default;
+            parts[1] = links.IsCreated && links.Length > 0     ? xxHash3.Hash128(links.GetUnsafeReadOnlyPtr(), (long)links.Length * UnsafeUtility.SizeOf<HotspotLink>()) : default;
+            return xxHash3.Hash128(parts, 2 * 16);
         }
 
         // Everything Find does but matching the groups (Match): the candidates, who is grouped with whom, how each is
@@ -316,7 +442,25 @@ namespace Chisel.Core
             state.Clear();
             if (!tiles.IsCreated || !layouts.IsCreated)
                 return;
-            // the slivers last, so a group always has a surface that shows its tile first
+            var candidates = Candidates(brushes, layouts, state, out var firstSliver);
+            if (candidates.Length < 2)
+            {
+                candidates.Dispose();
+                return;
+            }
+            var root   = new NativeArray<int>(candidates.Length, Allocator.Temp);
+            var unfold = new NativeArray<float4x4>(candidates.Length, Allocator.Temp);
+            GroupCandidates(brushes, candidates.AsArray(), firstSliver, links, root, unfold);
+            Compose(candidates.AsArray(), root, unfold, ref state);
+            root.Dispose();
+            unfold.Dispose();
+            candidates.Dispose();
+        }
+
+        // The candidates in candidate order: the slivers last (from firstSliver on), so a group always has a surface that
+        // shows its tile first
+        static NativeList<int2> Candidates(NativeList<BrushData> brushes, NativeArray<HotspotLayoutData> layouts, in FindState state, out int firstSliver)
+        {
             var candidates = new NativeList<int2>(64, Allocator.Temp);
             var slivers    = new NativeList<int2>(16, Allocator.Temp);
             var known      = state.kindStart.Length == brushes.Length + 1;
@@ -334,15 +478,412 @@ namespace Chisel.Core
                         candidates.Add(new int2(b, s));
                 }
             }
-            var firstSliver = candidates.Length;
+            firstSliver = candidates.Length;
             candidates.AddRange(slivers.AsArray());
             slivers.Dispose();
-            if (candidates.Length < 2)
+            return candidates;
+        }
+
+        // Prepare, grouping again only the candidates the edits since the last update can have changed the groups of
+        // (IncrementalHotspotGroups.md): its result is Prepare's. memory: what the last update found, kept with the tree.
+        public static void PrepareIncremental(NativeList<BrushData> brushes, NativeArray<HotspotTileData> tiles, NativeArray<HotspotLayoutData> layouts,
+                                              NativeArray<HotspotLink> links, ref FindState state, ref HotspotGroupMemory memory)
+        {
+            state.Clear();
+            memory.lastFull.Value  = true;
+            memory.lastDirty.Value = 0;
+            if (!tiles.IsCreated || !layouts.IsCreated)
             {
-                candidates.Dispose();
+                memory.Clear();
                 return;
             }
+            var candidates = Candidates(brushes, layouts, state, out var firstSliver);
+            var count      = candidates.Length;
+            var known      = state.kindStart.Length == brushes.Length + 1;
+            var keys       = new NativeArray<SurfaceKey>(count, Allocator.Temp);
+            var hashes     = new NativeArray<uint4>(count, Allocator.Temp);
+            for (int c = 0; c < count; c++)
+            {
+                var at = candidates[c];
+                keys[c] = new SurfaceKey { brush = brushes[at.x].brushIndexOrder.compactNodeID, surface = at.y };
+                hashes[c] = known ? state.hashes[state.kindStart[at.x] + at.y]
+                                  : SurfaceHash(ref brushes[at.x].brushRenderBuffer.Value.surfaces[at.y], c < firstSliver ? kCandidate : kSliver);
+            }
+            var inputs = GroupInputsKey(layouts, links);
+            var root   = new NativeArray<int>(count, Allocator.Temp);
+            var unfold = new NativeArray<float4x4>(count, Allocator.Temp);
+            var indexOf  = new UnsafeHashMap<SurfaceKey, int>(math.max(1, count), Allocator.Temp);
+            var dirty    = new NativeArray<bool>(count, Allocator.Temp);
+            var newCorners = new NativeArray<UnsafeList<float3>>(count, Allocator.Temp);
+            for (int c = 0; c < count; c++)
+                indexOf.TryAdd(keys[c], c);
+            var full = !memory.valid.Value || !memory.inputs.Value.Equals(inputs) || indexOf.Count != count || !SameOrder(brushes, memory.order);
+            if (!full)
+                full = !Regroup(brushes, candidates.AsArray(), firstSliver, links, keys, hashes, indexOf, dirty, newCorners, root, unfold, ref memory);
+            if (full)
+            {
+                for (int c = 0; c < count; c++)
+                {
+                    root[c] = c;
+                    unfold[c] = float4x4.identity;
+                    dirty[c] = true;
+                }
+                if (count >= 2)
+                    GroupCandidates(brushes, candidates.AsArray(), firstSliver, links, root, unfold);
+            }
+            if (count >= 2)
+                Compose(candidates.AsArray(), root, unfold, ref state);
+            Remember(full, brushes, candidates.AsArray(), keys, hashes, indexOf, dirty, newCorners, root, unfold, inputs, ref memory);
+            for (int c = 0; c < count; c++)
+            {
+                if (newCorners[c].IsCreated)
+                    newCorners[c].Dispose();
+            }
+            newCorners.Dispose(); dirty.Dispose(); indexOf.Dispose(); unfold.Dispose(); root.Dispose(); hashes.Dispose(); keys.Dispose();
+            candidates.Dispose();
+        }
 
+        // The brushes kept from the last update are in the same order (what each group's lead and its tree's ties read)
+        static bool SameOrder(NativeList<BrushData> brushes, NativeList<CompactNodeID> order)
+        {
+            var at = new UnsafeHashMap<CompactNodeID, int>(math.max(1, brushes.Length), Allocator.Temp);
+            for (int b = 0; b < brushes.Length; b++)
+                at.TryAdd(brushes[b].brushIndexOrder.compactNodeID, b);
+            var last = -1;
+            var same = true;
+            for (int i = 0; i < order.Length && same; i++)
+            {
+                if (!at.TryGetValue(order[i], out var b))
+                    continue;
+                same = b > last;
+                last = b;
+            }
+            at.Dispose();
+            return same;
+        }
+
+        // A candidate's corners, each once
+        static UnsafeList<float3> CornersOf(NativeList<BrushData> brushes, int2 at, Allocator allocator)
+        {
+            ref var vertices = ref brushes[at.x].brushRenderBuffer.Value.surfaces[at.y].colliderVertices;
+            var corners = new UnsafeList<float3>(vertices.Length, allocator);
+            var seen = new UnsafeHashSet<float3>(math.max(1, vertices.Length), Allocator.Temp);
+            for (int v = 0; v < vertices.Length; v++)
+            {
+                var p = vertices[v] + 0.0f;
+                if (seen.Add(p))
+                    corners.Add(p);
+            }
+            seen.Dispose();
+            return corners;
+        }
+
+        // The dirty candidates (changed, their neighbours, their kept groups, the neighbours of their slivers) grouped
+        // again; the others as they were kept. False when that is not to be done (most of the model is dirty, or what is
+        // kept does not hold together): everything is grouped again then.
+        static bool Regroup(NativeList<BrushData> brushes, NativeArray<int2> candidates, int firstSliver, NativeArray<HotspotLink> links,
+                            NativeArray<SurfaceKey> keys, NativeArray<uint4> hashes, UnsafeHashMap<SurfaceKey, int> indexOf, NativeArray<bool> dirty,
+                            NativeArray<UnsafeList<float3>> newCorners, NativeArray<int> root, NativeArray<float4x4> unfold, ref HotspotGroupMemory memory)
+        {
+            var count  = candidates.Length;
+            var kept   = memory.candidates;
+            var index  = memory.cornerIndex;
+            var groups = memory.members;
+            var queue  = new NativeList<int>(64, Allocator.Temp);
+            var changed = new NativeList<int>(16, Allocator.Temp);
+            var gone    = new NativeList<SurfaceKey>(16, Allocator.Temp);
+            try
+            {
+                void Mark(int c)
+                {
+                    if (dirty[c])
+                        return;
+                    dirty[c] = true;
+                    queue.Add(c);
+                }
+                void MarkKey(SurfaceKey key)
+                {
+                    if (indexOf.TryGetValue(key, out var c))
+                        Mark(c);
+                }
+                void MarkGroupOf(SurfaceKey key)
+                {
+                    if (!kept.TryGetValue(key, out var was))
+                        return;
+                    MarkKey(was.lead);
+                    if (groups.TryGetFirstValue(was.lead, out var member, out var it))
+                    {
+                        do MarkKey(member);
+                        while (groups.TryGetNextValue(out member, ref it));
+                    }
+                }
+                void MarkAround(float3 corner)
+                {
+                    if (index.TryGetFirstValue(corner, out var key, out var it))
+                    {
+                        do MarkKey(key);
+                        while (index.TryGetNextValue(out key, ref it));
+                    }
+                }
+
+                // what changed: new, different, gone
+                for (int c = 0; c < count; c++)
+                {
+                    if (!kept.TryGetValue(keys[c], out var was) || !was.hash.Equals(hashes[c]))
+                        changed.Add(c);
+                }
+                foreach (var pair in kept)
+                {
+                    if (!indexOf.ContainsKey(pair.Key))
+                        gone.Add(pair.Key);
+                }
+                if (changed.Length == 0 && gone.Length == 0)
+                {
+                    for (int c = 0; c < count; c++)
+                    {
+                        var was = kept[keys[c]];
+                        if (!indexOf.TryGetValue(was.lead, out var lead))
+                            return false;
+                        root[c]   = lead;
+                        unfold[c] = was.unfold;
+                    }
+                    memory.lastDirty.Value = 0;
+                    memory.lastFull.Value  = false;
+                    return true;
+                }
+
+                // their neighbours before, and their kept groups
+                for (int i = 0; i < changed.Length; i++)
+                {
+                    var c = changed[i];
+                    Mark(c);
+                    MarkGroupOf(keys[c]);
+                    if (kept.TryGetValue(keys[c], out var was))
+                    {
+                        for (int k = 0; k < was.corners.Length; k++)
+                            MarkAround(was.corners[k]);
+                    }
+                }
+                for (int i = 0; i < gone.Length; i++)
+                {
+                    MarkGroupOf(gone[i]);
+                    var was = kept[gone[i]];
+                    for (int k = 0; k < was.corners.Length; k++)
+                        MarkAround(was.corners[k]);
+                }
+
+                // the corner index as it is now
+                for (int i = 0; i < changed.Length; i++)
+                {
+                    var c = changed[i];
+                    if (kept.TryGetValue(keys[c], out var was))
+                    {
+                        for (int k = 0; k < was.corners.Length; k++)
+                            index.Remove(was.corners[k], keys[c]);
+                    }
+                }
+                for (int i = 0; i < gone.Length; i++)
+                {
+                    var was = kept[gone[i]];
+                    for (int k = 0; k < was.corners.Length; k++)
+                        index.Remove(was.corners[k], gone[i]);
+                }
+                for (int i = 0; i < changed.Length; i++)
+                {
+                    var c = changed[i];
+                    newCorners[c] = CornersOf(brushes, candidates[c], Allocator.Persistent);
+                    var corners = newCorners[c];
+                    for (int k = 0; k < corners.Length; k++)
+                        index.Add(corners[k], keys[c]);
+                }
+
+                // their neighbours now
+                for (int i = 0; i < changed.Length; i++)
+                {
+                    var corners = newCorners[changed[i]];
+                    for (int k = 0; k < corners.Length; k++)
+                        MarkAround(corners[k]);
+                }
+
+                // every dirty candidate's kept group, and a dirty sliver's neighbours now, until nothing is added
+                for (int q = 0; q < queue.Length; q++)
+                {
+                    var c = queue[q];
+                    MarkGroupOf(keys[c]);
+                    if (c < firstSliver)
+                        continue;
+                    if (newCorners[c].IsCreated)
+                    {
+                        var corners = newCorners[c];
+                        for (int k = 0; k < corners.Length; k++)
+                            MarkAround(corners[k]);
+                    } else
+                    {
+                        var corners = kept[keys[c]].corners;
+                        for (int k = 0; k < corners.Length; k++)
+                            MarkAround(corners[k]);
+                    }
+                }
+
+                var dirtyCount = queue.Length;
+                memory.lastDirty.Value = dirtyCount;
+                if (dirtyCount * 2 > count)
+                    return false;
+
+                // the dirty candidates grouped by themselves, in their candidate order
+                var local       = new NativeArray<int2>(dirtyCount, Allocator.Temp);
+                var globalOf    = new NativeArray<int>(dirtyCount, Allocator.Temp);
+                var localRoot   = new NativeArray<int>(dirtyCount, Allocator.Temp);
+                var localUnfold = new NativeArray<float4x4>(dirtyCount, Allocator.Temp);
+                var localFirstSliver = 0;
+                var n = 0;
+                for (int c = 0; c < count; c++)
+                {
+                    if (!dirty[c])
+                        continue;
+                    if (c < firstSliver)
+                        localFirstSliver++;
+                    local[n]    = candidates[c];
+                    globalOf[n] = c;
+                    n++;
+                }
+                if (n > 0)
+                    GroupCandidates(brushes, local, localFirstSliver, links, localRoot, localUnfold);
+                for (int i = 0; i < n; i++)
+                {
+                    root[globalOf[i]]   = globalOf[localRoot[i]];
+                    unfold[globalOf[i]] = localUnfold[i];
+                }
+                local.Dispose(); globalOf.Dispose(); localRoot.Dispose(); localUnfold.Dispose();
+
+                // the others as they were kept: a clean candidate's lead is clean (its kept group is clean)
+                for (int c = 0; c < count; c++)
+                {
+                    if (dirty[c])
+                        continue;
+                    var was = kept[keys[c]];
+                    if (!indexOf.TryGetValue(was.lead, out var lead) || dirty[lead])
+                        return false;
+                    root[c]   = lead;
+                    unfold[c] = was.unfold;
+                }
+                memory.lastFull.Value = false;
+                return true;
+            }
+            finally
+            {
+                queue.Dispose(); changed.Dispose(); gone.Dispose();
+            }
+        }
+
+        // What this update found, kept for the next: everything again (full), or the dirty candidates and the gone ones
+        static void Remember(bool full, NativeList<BrushData> brushes, NativeArray<int2> candidates, NativeArray<SurfaceKey> keys, NativeArray<uint4> hashes,
+                             UnsafeHashMap<SurfaceKey, int> indexOf, NativeArray<bool> dirty, NativeArray<UnsafeList<float3>> newCorners, NativeArray<int> root, NativeArray<float4x4> unfold,
+                             uint4 inputs, ref HotspotGroupMemory memory)
+        {
+            var count = candidates.Length;
+            var size  = new NativeArray<int>(count, Allocator.Temp);
+            for (int c = 0; c < count; c++)
+                size[root[c]]++;
+            if (full)
+            {
+                memory.Clear();
+                for (int c = 0; c < count; c++)
+                {
+                    var corners = newCorners[c].IsCreated ? newCorners[c] : CornersOf(brushes, candidates[c], Allocator.Persistent);
+                    newCorners[c] = default;
+                    memory.candidates.TryAdd(keys[c], new KeptCandidate { hash = hashes[c], lead = keys[root[c]], unfold = unfold[c], corners = corners });
+                    for (int k = 0; k < corners.Length; k++)
+                        memory.cornerIndex.Add(corners[k], keys[c]);
+                }
+            } else
+            {
+                // the gone ones
+                using (var gone = new NativeList<SurfaceKey>(16, Allocator.Temp))
+                {
+                    foreach (var pair in memory.candidates)
+                    {
+                        if (!indexOf.ContainsKey(pair.Key))
+                            gone.Add(pair.Key);
+                    }
+                    for (int i = 0; i < gone.Length; i++)
+                    {
+                        var was = memory.candidates[gone[i]];
+                        memory.members.Remove(was.lead);
+                        if (was.corners.IsCreated)
+                            was.corners.Dispose();
+                        memory.candidates.Remove(gone[i]);
+                    }
+                }
+                // the dirty ones' old groups (all of them dirty) forgotten, then everything they are now
+                for (int c = 0; c < count; c++)
+                {
+                    if (dirty[c] && memory.candidates.TryGetValue(keys[c], out var was))
+                        memory.members.Remove(was.lead);
+                }
+                for (int c = 0; c < count; c++)
+                {
+                    if (!dirty[c])
+                        continue;
+                    var entry = memory.candidates.TryGetValue(keys[c], out var was) ? was : default;
+                    if (newCorners[c].IsCreated)
+                    {
+                        if (entry.corners.IsCreated)
+                            entry.corners.Dispose();
+                        entry.corners = newCorners[c];
+                        newCorners[c] = default;
+                    }
+                    entry.hash   = hashes[c];
+                    entry.lead   = keys[root[c]];
+                    entry.unfold = unfold[c];
+                    memory.candidates[keys[c]] = entry;
+                }
+            }
+            for (int c = 0; c < count; c++)
+            {
+                if ((full || dirty[c]) && size[root[c]] >= 2)
+                    memory.members.Add(keys[root[c]], keys[c]);
+            }
+            size.Dispose();
+            memory.order.Clear();
+            for (int b = 0; b < brushes.Length; b++)
+                memory.order.Add(brushes[b].brushIndexOrder.compactNodeID);
+            memory.inputs.Value = inputs;
+            memory.valid.Value  = true;
+        }
+
+        // The same result as Prepare's: false and the first difference when it is not
+        public static bool SameAs(in FindState a, in FindState b, out FixedString512Bytes difference)
+        {
+            difference = default;
+            if (a.candidates.Length != b.candidates.Length) { difference.Append((FixedString64Bytes)"candidates: "); difference.Append(a.candidates.Length); difference.Append((FixedString32Bytes)" vs "); difference.Append(b.candidates.Length); return false; }
+            for (int c = 0; c < a.candidates.Length; c++)
+            {
+                if (!a.candidates[c].Equals(b.candidates[c])) { difference.Append((FixedString64Bytes)"candidate "); difference.Append(c); return false; }
+                if (!math.all(math.asuint(a.unfold[c].c0) == math.asuint(b.unfold[c].c0)) || !math.all(math.asuint(a.unfold[c].c1) == math.asuint(b.unfold[c].c1)) ||
+                    !math.all(math.asuint(a.unfold[c].c2) == math.asuint(b.unfold[c].c2)) || !math.all(math.asuint(a.unfold[c].c3) == math.asuint(b.unfold[c].c3)))
+                { difference.Append((FixedString64Bytes)"unfold of candidate "); difference.Append(c); return false; }
+                if (a.memberOf[c] != b.memberOf[c]) { difference.Append((FixedString64Bytes)"memberOf at "); difference.Append(c); return false; }
+            }
+            if (a.memberStart.Length != b.memberStart.Length) { difference.Append((FixedString64Bytes)"memberStart length"); return false; }
+            for (int i = 0; i < a.memberStart.Length; i++)
+            {
+                if (a.memberStart[i] != b.memberStart[i]) { difference.Append((FixedString64Bytes)"memberStart at "); difference.Append(i); return false; }
+            }
+            if (a.leads.Length != b.leads.Length) { difference.Append((FixedString64Bytes)"leads: "); difference.Append(a.leads.Length); difference.Append((FixedString32Bytes)" vs "); difference.Append(b.leads.Length); return false; }
+            for (int i = 0; i < a.leads.Length; i++)
+            {
+                if (a.leads[i] != b.leads[i]) { difference.Append((FixedString64Bytes)"lead "); difference.Append(i); return false; }
+            }
+            return true;
+        }
+
+        // Who is grouped with whom among these candidates (in candidate order, the slivers from firstSliver on): each one's
+        // root (its group's smallest candidate), and how it is unfolded into its group's first plane. Reads nothing of a
+        // candidate that is not among them.
+        static void GroupCandidates(NativeList<BrushData> brushes, NativeArray<int2> candidates, int firstSliver, NativeArray<HotspotLink> links,
+                          NativeArray<int> root, NativeArray<float4x4> unfold)
+        {
             // who has each corner (each corner numbered, with each surface that has it, in order), and how many corners each
             // two share
             var cornerId = new UnsafeHashMap<float3, int>(candidates.Length * 8, Allocator.Temp);
@@ -538,7 +1079,6 @@ namespace Chisel.Core
                 adjacency[adjacencyAt[tree[j].y]++] = tree[j].x;
             }
             adjacencyAt.Dispose();
-            var unfold  = new NativeArray<float4x4>(candidates.Length, Allocator.Temp);
             var reached = new NativeArray<bool>(candidates.Length, Allocator.Temp);
             var queue   = new NativeList<int>(16, Allocator.Temp);
             for (int c = 0; c < candidates.Length; c++)
@@ -570,10 +1110,22 @@ namespace Chisel.Core
             adjacencyStart.Dispose();
             tree.Dispose();
             joined.Dispose();
-            // each group's surfaces, in candidate order
+            for (int c = 0; c < candidates.Length; c++)
+                root[c] = Root(c);
+            size.Dispose();
+            parent.Dispose();
+        }
+
+        // The state Match reads, from each candidate's root and unfold: the groups' members in candidate order, the leads
+        // of the groups of two or more
+        static void Compose(NativeArray<int2> candidates, NativeArray<int> root, NativeArray<float4x4> unfold, ref FindState state)
+        {
+            var size = new NativeArray<int>(candidates.Length, Allocator.Temp);
+            for (int c = 0; c < candidates.Length; c++)
+                size[root[c]]++;
             var memberStart = new NativeArray<int>(candidates.Length + 1, Allocator.Temp);
             for (int c = 0; c < candidates.Length; c++)
-                memberStart[Root(c) + 1]++;
+                memberStart[root[c] + 1]++;
             for (int c = 0; c < candidates.Length; c++)
                 memberStart[c + 1] += memberStart[c];
             var memberAt = new NativeArray<int>(candidates.Length, Allocator.Temp);
@@ -581,7 +1133,7 @@ namespace Chisel.Core
             for (int c = 0; c < candidates.Length; c++)
                 memberAt[c] = memberStart[c];
             for (int c = 0; c < candidates.Length; c++)
-                memberOf[memberAt[Root(c)]++] = c;
+                memberOf[memberAt[root[c]]++] = c;
             memberAt.Dispose();
             for (int c = 0; c < candidates.Length; c++)
             {
@@ -593,16 +1145,13 @@ namespace Chisel.Core
                 state.memberStart.Add(memberStart[c]);
             for (int lead = 0; lead < candidates.Length; lead++)
             {
-                if (Root(lead) == lead && size[lead] >= 2)
+                if (root[lead] == lead && size[lead] >= 2)
                     state.leads.Add(lead);
             }
             state.matches.Resize(state.leads.Length, NativeArrayOptions.ClearMemory);
             memberStart.Dispose();
             memberOf.Dispose();
             size.Dispose();
-            unfold.Dispose();
-            parent.Dispose();
-            candidates.Dispose();
         }
 
         // One group matched as one surface on its first member's settings; each is independent of the others

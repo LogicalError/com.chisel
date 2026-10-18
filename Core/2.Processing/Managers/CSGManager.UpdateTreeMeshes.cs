@@ -2548,14 +2548,10 @@ namespace Chisel.Core
                         JobHandles.Read(JobHandleType.decalVolumesJobHandle),
                         JobHandles.Write(JobHandleType.brushRenderDataJobHandle));
 
-                    var prepareHotspotGroupsJob = new PrepareHotspotGroupsJob
+                    var finishWeldJob = new FinishWeldJob
                     {
                         // Read
-                        weldCopies     = Temporaries.weld.copies,
-                        hotspotTiles   = Temporaries.hotspotTiles,
-                        hotspotLayouts = Temporaries.hotspotLayouts,
-                        hotspotLinks   = Temporaries.hotspotLinks,
-                        hotspotTileSides = Temporaries.hotspotTileSides,
+                        weldCopies           = Temporaries.weld.copies,
 
                         // Write
                         brushRenderData      = Temporaries.brushRenderData,
@@ -2563,6 +2559,34 @@ namespace Chisel.Core
                         hotspotCut           = Temporaries.hotspotCut,
                         hotspotFind          = Temporaries.hotspotFind,
                         weldCopyCache        = chiselLookupValues.weldCopyCache
+                    };
+                    finishWeldJob.Schedule(runInParallel,
+                        JobHandles.Read(JobHandleType.decalVolumesJobHandle),
+                        JobHandles.Write(JobHandleType.brushRenderDataJobHandle));
+
+                    var surfaceKindsJob = new SurfaceKindsJob
+                    {
+                        brushRenderData = Temporaries.brushRenderData.AsDeferredJobArray(),
+                        hotspotLayouts  = Temporaries.hotspotLayouts,
+                        kindStart       = Temporaries.hotspotFind.kindStart.AsDeferredJobArray(),
+                        kinds           = Temporaries.hotspotFind.kinds.AsDeferredJobArray()
+                    };
+                    surfaceKindsJob.Schedule(runInParallel, Temporaries.brushRenderData, 16,
+                        JobHandles.Read(JobHandleType.decalVolumesJobHandle),
+                        JobHandles.Write(JobHandleType.brushRenderDataJobHandle));
+
+                    var prepareHotspotGroupsJob = new PrepareHotspotGroupsJob
+                    {
+                        // Read
+                        hotspotTiles   = Temporaries.hotspotTiles,
+                        hotspotLayouts = Temporaries.hotspotLayouts,
+                        hotspotLinks   = Temporaries.hotspotLinks,
+                        hotspotTileSides = Temporaries.hotspotTileSides,
+
+                        // Write
+                        brushRenderData      = Temporaries.brushRenderData,
+                        hotspotCut           = Temporaries.hotspotCut,
+                        hotspotFind          = Temporaries.hotspotFind
                     };
                     prepareHotspotGroupsJob.Schedule(runInParallel,
                         JobHandles.Read(JobHandleType.decalVolumesJobHandle),

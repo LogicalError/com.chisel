@@ -341,18 +341,35 @@ namespace Chisel.Core
         }
     }
 
-    // The weld's copies handed to their brushes, then who is grouped with whom (MatchHotspotGroupsJob)
+    // Who is grouped with whom (MatchHotspotGroupsJob), once the weld's copies are handed out (FinishWeldJob)
     [BurstCompile(CompileSynchronously = true)]
     struct PrepareHotspotGroupsJob : IJob
     {
         // Read
-        [NoAlias, ReadOnly] public NativeList<WeldCopy>           weldCopies;
         [NoAlias, ReadOnly] public NativeArray<HotspotTileData>   hotspotTiles;
         [NoAlias, ReadOnly] public NativeArray<HotspotLayoutData> hotspotLayouts;
         [NoAlias, ReadOnly] public NativeArray<HotspotLink>       hotspotLinks;
         [NoAlias, ReadOnly] public NativeArray<float4>            hotspotTileSides;
 
         // Write
+        [NoAlias] public NativeList<BrushData> brushRenderData;
+        [NoAlias] public HotspotCutState hotspotCut;
+        [NoAlias] public FindState       hotspotFind;
+
+        public void Execute()
+        {
+            HotspotGroups.Borders(brushRenderData, hotspotLinks, ref hotspotCut.bordersOf);
+            HotspotGroups.Prepare(brushRenderData, hotspotTiles, hotspotLayouts, hotspotLinks, ref hotspotFind);
+            hotspotFind.inputs.Value = HotspotGroups.InputsKey(hotspotTiles, hotspotLayouts, hotspotTileSides);
+        }
+    }
+
+    // The weld's copies handed to their brushes (each brush's own buffer kept first), and room for the surfaces' kinds
+    [BurstCompile(CompileSynchronously = true)]
+    struct FinishWeldJob : IJob
+    {
+        [NoAlias, ReadOnly] public NativeList<WeldCopy> weldCopies;
+
         [NoAlias] public NativeList<BrushData> brushRenderData;
         [NoAlias] public NativeList<BlobAssetReference<ChiselBrushRenderBuffer>> patchedRenderBuffers;
         [NoAlias] public HotspotCutState hotspotCut;
@@ -366,9 +383,22 @@ namespace Chisel.Core
             for (int i = 0; i < brushRenderData.Length; i++)
                 hotspotCut.kept.Add(brushRenderData[i].brushRenderBuffer);
             OutputModelWeld.FinishWeld(brushRenderData, patchedRenderBuffers, weldCopies, weldCopyCache);
-            HotspotGroups.Borders(brushRenderData, hotspotLinks, ref hotspotCut.bordersOf);
-            HotspotGroups.Prepare(brushRenderData, hotspotTiles, hotspotLayouts, hotspotLinks, ref hotspotFind);
-            hotspotFind.inputs.Value = HotspotGroups.InputsKey(hotspotTiles, hotspotLayouts, hotspotTileSides);
+            HotspotGroups.StartKinds(brushRenderData, ref hotspotFind);
+        }
+    }
+
+    // Each brush's surfaces' part in the hotspot groups (HotspotGroups.KindsOf), brush by brush
+    [BurstCompile(CompileSynchronously = true)]
+    struct SurfaceKindsJob : IJobParallelForDefer
+    {
+        [NoAlias, ReadOnly] public NativeArray<BrushData>         brushRenderData;
+        [NoAlias, ReadOnly] public NativeArray<HotspotLayoutData> hotspotLayouts;
+        [NoAlias, ReadOnly] public NativeArray<int>               kindStart;
+        [NativeDisableParallelForRestriction] [NoAlias] public NativeArray<byte> kinds;
+
+        public void Execute(int b)
+        {
+            HotspotGroups.KindsOf(b, brushRenderData, hotspotLayouts, kindStart, kinds);
         }
     }
 

@@ -53,6 +53,10 @@ namespace Chisel.Core
         public NativeList<GroupMatch> matches;
         // what every match reads (InputsKey)
         public NativeReference<uint4> inputs;
+        // each surface's part in the groups (HotspotGroups.KindOf), when worked out brush by brush before Prepare
+        // (StartKinds, KindsOf): kinds from kindStart[brush]
+        public NativeList<int>  kindStart;
+        public NativeList<byte> kinds;
 
         public static FindState Create(Allocator allocator)
         {
@@ -64,7 +68,9 @@ namespace Chisel.Core
                 memberOf    = new NativeList<int>(64, allocator),
                 leads       = new NativeList<int>(16, allocator),
                 matches     = new NativeList<GroupMatch>(16, allocator),
-                inputs      = new NativeReference<uint4>(allocator)
+                inputs      = new NativeReference<uint4>(allocator),
+                kindStart   = new NativeList<int>(64, allocator),
+                kinds       = new NativeList<byte>(64, allocator)
             };
         }
 
@@ -92,13 +98,15 @@ namespace Chisel.Core
             if (memberOf.IsCreated)    memberOf.Dispose();
             if (leads.IsCreated)       leads.Dispose();
             if (inputs.IsCreated)      inputs.Dispose();
+            if (kindStart.IsCreated)   kindStart.Dispose();
+            if (kinds.IsCreated)       kinds.Dispose();
         }
 
         public Unity.Jobs.JobHandle Dispose(Unity.Jobs.JobHandle dependency)
         {
             if (matches.IsCreated)
                 dependency = Unity.Jobs.IJobExtensions.Schedule(new FreeGroupMatchesJob { matches = matches }, dependency);
-            var handles = new NativeArray<Unity.Jobs.JobHandle>(7, Allocator.Temp);
+            var handles = new NativeArray<Unity.Jobs.JobHandle>(9, Allocator.Temp);
             for (int i = 0; i < handles.Length; i++)
                 handles[i] = dependency;
             if (matches.IsCreated)     handles[0] = matches.Dispose(dependency);
@@ -108,6 +116,8 @@ namespace Chisel.Core
             if (memberOf.IsCreated)    handles[4] = memberOf.Dispose(dependency);
             if (leads.IsCreated)       handles[5] = leads.Dispose(dependency);
             if (inputs.IsCreated)      handles[6] = inputs.Dispose(dependency);
+            if (kindStart.IsCreated)   handles[7] = kindStart.Dispose(dependency);
+            if (kinds.IsCreated)       handles[8] = kinds.Dispose(dependency);
             var all = Unity.Jobs.JobHandle.CombineDependencies(handles);
             handles.Dispose();
             return all;
@@ -261,6 +271,43 @@ namespace Chisel.Core
             }
         }
 
+        const byte kCandidate = 1, kSliver = 2;
+
+        // A surface's part in the groups: none (0), a candidate (1), or a sliver too narrow to show a tile (2)
+        public static byte KindOf(ref ChiselSurfaceRenderBuffer surface, NativeArray<HotspotLayoutData> layouts)
+        {
+            if (!layouts.IsCreated || !(surface.hotspotSource.layout > 0 && surface.hotspotSource.layout <= layouts.Length &&
+                                        surface.indices.Length >= 3 && surface.decalEntityID == 0))
+                return 0;
+            var source = surface.hotspotSource;
+            var texels = layouts[source.layout - 1].pixelsPerUnit * (source.density > 0 ? source.density : 1);
+            return Width(ref surface.colliderVertices, source) * texels < kSliverTexels ? kSliver : kCandidate;
+        }
+
+        // Room for each surface's kind (KindsOf), brush by brush
+        public static void StartKinds(NativeList<BrushData> brushes, ref FindState state)
+        {
+            state.kindStart.ResizeUninitialized(brushes.Length + 1);
+            var total = 0;
+            for (int b = 0; b < brushes.Length; b++)
+            {
+                state.kindStart[b] = total;
+                total += brushes[b].brushRenderBuffer.IsCreated ? brushes[b].brushRenderBuffer.Value.surfaces.Length : 0;
+            }
+            state.kindStart[brushes.Length] = total;
+            state.kinds.ResizeUninitialized(total);
+        }
+
+        // The kinds of a brush's surfaces (KindOf); each brush is independent of the others
+        public static void KindsOf(int b, NativeArray<BrushData> brushes, NativeArray<HotspotLayoutData> layouts, NativeArray<int> kindStart, NativeArray<byte> kinds)
+        {
+            if (!brushes[b].brushRenderBuffer.IsCreated)
+                return;
+            ref var surfaces = ref brushes[b].brushRenderBuffer.Value.surfaces;
+            for (int s = 0; s < surfaces.Length; s++)
+                kinds[kindStart[b] + s] = KindOf(ref surfaces[s], layouts);
+        }
+
         // Everything Find does but matching the groups (Match): the candidates, who is grouped with whom, how each is
         // unfolded, and the groups to match (state.leads)
         public static void Prepare(NativeList<BrushData> brushes, NativeArray<HotspotTileData> tiles, NativeArray<HotspotLayoutData> layouts,
@@ -272,6 +319,7 @@ namespace Chisel.Core
             // the slivers last, so a group always has a surface that shows its tile first
             var candidates = new NativeList<int2>(64, Allocator.Temp);
             var slivers    = new NativeList<int2>(16, Allocator.Temp);
+            var known      = state.kindStart.Length == brushes.Length + 1;
             for (int b = 0; b < brushes.Length; b++)
             {
                 if (!brushes[b].brushRenderBuffer.IsCreated)
@@ -279,17 +327,11 @@ namespace Chisel.Core
                 ref var surfaces = ref brushes[b].brushRenderBuffer.Value.surfaces;
                 for (int s = 0; s < surfaces.Length; s++)
                 {
-                    ref var surface = ref surfaces[s];
-                    if (surface.hotspotSource.layout > 0 && surface.hotspotSource.layout <= layouts.Length &&
-                        surface.indices.Length >= 3 && surface.decalEntityID == 0)
-                    {
-                        var source  = surface.hotspotSource;
-                        var texels  = layouts[source.layout - 1].pixelsPerUnit * (source.density > 0 ? source.density : 1);
-                        if (Width(ref surface.colliderVertices, source) * texels < kSliverTexels)
-                            slivers.Add(new int2(b, s));
-                        else
-                            candidates.Add(new int2(b, s));
-                    }
+                    var kind = known ? state.kinds[state.kindStart[b] + s] : KindOf(ref surfaces[s], layouts);
+                    if (kind == kSliver)
+                        slivers.Add(new int2(b, s));
+                    else if (kind == kCandidate)
+                        candidates.Add(new int2(b, s));
                 }
             }
             var firstSliver = candidates.Length;
@@ -905,27 +947,71 @@ namespace Chisel.Core
             var points = new NativeArray<float2>(count, Allocator.Temp);
             for (int v = 0; v < count; v++)
                 points[v] = new float2(math.dot(corners[v], right), math.dot(corners[v], up));
+            // the narrowest direction lies along an edge of the corners' hull, and across it the farthest corner of the hull
+            // only moves on as the edges go round (rotating calipers)
+            var hull = Hull(points);
+            var h = hull.Length;
             var width = float.PositiveInfinity;
-            for (int i = 0; i < count && width > 0; i++)
+            if (h == 2)
+                width = 0;
+            else if (h > 2)
             {
-                for (int j = i + 1; j < count; j++)
+                var far = 1;
+                for (int e = 0; e < h && width > 0; e++)
                 {
+                    var i = hull[e]; var j = hull[(e + 1) % h];
                     var d = points[j] - points[i];
                     var length = math.length(d);
                     if (!(length > 0))
                         continue;
                     d /= length;
-                    float lo = float.PositiveInfinity, hi = float.NegativeInfinity;
-                    for (int k = 0; k < count; k++)
-                    {
-                        var across = d.x * (points[k].y - points[i].y) - d.y * (points[k].x - points[i].x);
-                        lo = math.min(lo, across); hi = math.max(hi, across);
-                    }
-                    width = math.min(width, hi - lo);
+                    float Across(int k) => d.x * (points[hull[k]].y - points[i].y) - d.y * (points[hull[k]].x - points[i].x);
+                    for (int step = 0; step < h && Across((far + 1) % h) >= Across(far); step++)
+                        far = (far + 1) % h;
+                    width = math.min(width, Across(far));
                 }
             }
+            hull.Dispose();
             points.Dispose();
             return float.IsPositiveInfinity(width) ? 0 : width;
+        }
+
+        struct ByXY : System.Collections.Generic.IComparer<int>
+        {
+            public NativeArray<float2> points;
+            public readonly int Compare(int a, int b)
+            {
+                var p = points[a]; var q = points[b];
+                return p.x != q.x ? p.x.CompareTo(q.x) : p.y.CompareTo(q.y);
+            }
+        }
+
+        // The corners of the points' convex hull, in order (Andrew's monotone chain)
+        static NativeList<int> Hull(NativeArray<float2> points)
+        {
+            var order = new NativeArray<int>(points.Length, Allocator.Temp);
+            for (int i = 0; i < order.Length; i++)
+                order[i] = i;
+            order.Sort(new ByXY { points = points });
+            var hull = new NativeList<int>(points.Length + 1, Allocator.Temp);
+            float Cross(int o, int a, int b) => (points[a].x - points[o].x) * (points[b].y - points[o].y) - (points[a].y - points[o].y) * (points[b].x - points[o].x);
+            for (int k = 0; k < order.Length; k++)
+            {
+                while (hull.Length >= 2 && Cross(hull[hull.Length - 2], hull[hull.Length - 1], order[k]) <= 0)
+                    hull.RemoveAt(hull.Length - 1);
+                hull.Add(order[k]);
+            }
+            var lower = hull.Length + 1;
+            for (int k = order.Length - 2; k >= 0; k--)
+            {
+                while (hull.Length >= lower && Cross(hull[hull.Length - 2], hull[hull.Length - 1], order[k]) <= 0)
+                    hull.RemoveAt(hull.Length - 1);
+                hull.Add(order[k]);
+            }
+            if (hull.Length > 1)
+                hull.RemoveAt(hull.Length - 1);
+            order.Dispose();
+            return hull;
         }
 
         static bool SameAxis(float3 a, float3 b)

@@ -225,7 +225,6 @@ namespace Chisel.Core
                 public UnityEngine.Mesh.MeshDataArray       meshDataArray;
                 public NativeList<UnityEngine.Mesh.MeshData> meshDatas;
 
-                public NativeArray<int>                     parameterCounts;
                 public NativeList<NodeOrderNodeID>          transformTreeBrushIndicesList;
 
                 public NativeList<CompactNodeID>            brushes;
@@ -340,9 +339,6 @@ namespace Chisel.Core
                 transformTreeBrushIndicesListJobHandle,
                 brushesJobHandle,
                 nodesJobHandle,
-                parametersJobHandle,
-                allKnownBrushMeshIndicesJobHandle,
-                parameterCountsJobHandle,
                 allBrushMeshIDsJobHandle,
                 allTreeBrushIndexOrdersJobHandle,
                 allUpdateBrushIndexOrdersJobHandle,
@@ -538,7 +534,6 @@ namespace Chisel.Core
 
                 ref var compactHierarchy = ref CompactHierarchyManager.GetHierarchy(this.treeCompactNodeID);
 
-                Temporaries.parameterCounts                = new NativeArray<int>(chiselLookupValues.parameters.Length, defaultAllocator);
                 Temporaries.transformTreeBrushIndicesList  = new NativeList<NodeOrderNodeID>(defaultAllocator);
                 Temporaries.nodes                          = new NativeList<CompactNodeID>(defaultAllocator);
                 Temporaries.brushes                        = new NativeList<CompactNodeID>(defaultAllocator);
@@ -648,14 +643,6 @@ namespace Chisel.Core
                 Temporaries.mergeBrushState                = new NativeArray<int>(kMergeIterations * this.brushCount, defaultAllocator);
 
                 Temporaries.vertexBufferContents.EnsureInitialized();
-
-                // Regular index operator will return a copy instead of a reference *sigh*
-                for (int l = 0; l < SurfaceDestinationParameters.ParameterCount; l++)
-                {
-                    var parameter = chiselLookupValues.parameters[l];
-                    parameter.Clear();
-                    chiselLookupValues.parameters[l] = parameter;
-                }
 
                 #region MeshQueries
                 // TODO: have more control over the queries
@@ -1341,28 +1328,18 @@ namespace Chisel.Core
                         var updateBrushMeshIDsJob = new UpdateBrushMeshIDsJob
                         {
                             // Read
-                            brushMeshBlobs           = brushMeshBlobs,
                             brushCount               = this.brushCount,
                             brushes                  = Temporaries.brushes,
                             compactHierarchy         = CompactHierarchyManager.GetReadOnlyHierarchy(treeCompactNodeID),
-
-                            // Read / Write
-                            allKnownBrushMeshIndices = chiselLookupValues.allKnownBrushMeshIndices,
-                            parameters               = chiselLookupValues.parameters,
-                            parameterCounts          = Temporaries.parameterCounts,
 
                             // Write
                             allBrushMeshIDs          = Temporaries.allBrushMeshIDs
                         };
                         var jobHandle = updateBrushMeshIDsJob.Schedule(runInParallel,
                             JobHandles.Read(
-                                JobHandleType.brushMeshBlobsLookupJobHandle,
                                 JobHandleType.brushesJobHandle,
 								JobHandleType.compactHierarchyJobHandle),
                             JobHandles.Write(
-                                JobHandleType.allKnownBrushMeshIndicesJobHandle,
-                                JobHandleType.parametersJobHandle,
-                                JobHandleType.parameterCountsJobHandle,
                                 JobHandleType.allBrushMeshIDsJobHandle));
                         //jobHandle.Complete();
 					}
@@ -2431,11 +2408,6 @@ namespace Chisel.Core
 				#endregion
 
 
-				// TODO: store parameterCounts per brush (precalculated), manage these counts in the hierarchy when brushes are added/removed/modified
-				//       then we don't need to count them here & don't need to do a "complete" here
-				JobHandles[JobHandleType.parameterCountsJobHandle].Complete();
-                JobHandles[JobHandleType.parameterCountsJobHandle] = default;
-
                 JobHandles[JobHandleType.staleLoopBrushesJobHandle].readWriteBarrier.Complete();
                 skipMeshGeneration = Temporaries.staleLoopBrushes.IsCreated &&
                                      Temporaries.staleLoopBrushes.Length > 0 &&
@@ -3141,9 +3113,6 @@ namespace Chisel.Core
                                                 JobHandleExtensions.CombineDependencies(
                                                     JobHandles[JobHandleType.brushesJobHandle].writeBarrier,
                                                     JobHandles[JobHandleType.nodesJobHandle].writeBarrier, 
-                                                    JobHandles[JobHandleType.parametersJobHandle].writeBarrier,
-                                                    JobHandles[JobHandleType.allKnownBrushMeshIndicesJobHandle].writeBarrier,
-                                                    JobHandles[JobHandleType.parameterCountsJobHandle].writeBarrier,
                                                     JobHandles[JobHandleType.storeToCacheJobHandle].writeBarrier),
                                                 JobHandleExtensions.CombineDependencies(
                                                     JobHandles[JobHandleType.surfaceCountRefJobHandle].writeBarrier,
@@ -3171,7 +3140,6 @@ namespace Chisel.Core
                 lastJobHandle.AddDependency(Temporaries.brushIntersectionsWith       .SafeDispose(JobHandles[JobHandleType.brushIntersectionsWithJobHandle].readWriteBarrier));
                 lastJobHandle.AddDependency(Temporaries.outputSurfaceVertices        .SafeDispose(JobHandles[JobHandleType.outputSurfaceVerticesJobHandle].readWriteBarrier));
                 lastJobHandle.AddDependency(Temporaries.outputSurfacesRange          .SafeDispose(JobHandles[JobHandleType.outputSurfacesRangeJobHandle].readWriteBarrier));
-                lastJobHandle.AddDependency(Temporaries.parameterCounts              .SafeDispose(JobHandles[JobHandleType.parameterCountsJobHandle].readWriteBarrier));
                 lastJobHandle.AddDependency(Temporaries.brushMeshLookup              .SafeDispose(JobHandles[JobHandleType.brushMeshLookupJobHandle].readWriteBarrier));
                 lastJobHandle.AddDependency(Temporaries.outputSurfaces               .SafeDispose(JobHandles[JobHandleType.outputSurfacesJobHandle].readWriteBarrier));
                 
@@ -3296,10 +3264,7 @@ namespace Chisel.Core
                                                     JobHandles[JobHandleType.uniqueBrushPairsJobHandle].writeBarrier),
                                                 JobHandleExtensions.CombineDependencies(
                                                     JobHandles[JobHandleType.transformTreeBrushIndicesListJobHandle].writeBarrier,
-                                                    JobHandles[JobHandleType.nodesJobHandle].writeBarrier,
-                                                    JobHandles[JobHandleType.parametersJobHandle].writeBarrier,
-                                                    JobHandles[JobHandleType.allKnownBrushMeshIndicesJobHandle].writeBarrier,
-                                                    JobHandles[JobHandleType.parameterCountsJobHandle].writeBarrier),
+                                                    JobHandles[JobHandleType.nodesJobHandle].writeBarrier),
                                                 JobHandleExtensions.CombineDependencies(
                                                     JobHandles[JobHandleType.storeToCacheJobHandle].writeBarrier,
 

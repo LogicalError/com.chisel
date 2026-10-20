@@ -15,8 +15,6 @@ namespace Chisel.Core
             public JobHandle                            lastJobHandle;
 
             public NativeList<CompactNodeID>            brushIDValues;
-            public NativeArray<ChiselLayerParameters>   parameters; 
-            public NativeParallelHashSet<int>           allKnownBrushMeshIndices;
 
             public NativeList<BlobAssetReference<BasePolygonsBlob>>             basePolygonCache;
             public NativeList<BlobAssetReference<RoutingTable>>                 routingTableCache;
@@ -64,7 +62,6 @@ namespace Chisel.Core
 			internal void Initialize()
             {
                 brushIDValues               = new NativeList<CompactNodeID>(1000, Allocator.Persistent); // Confirmed to get disposed
-				allKnownBrushMeshIndices    = new NativeParallelHashSet<int>(1000, Allocator.Persistent); // Confirmed to get disposed
 
 				brushRenderBufferLookup     = new NativeParallelHashMap<CompactNodeID, BlobAssetReference<ChiselBrushRenderBuffer>>(1000, Allocator.Persistent); // Confirmed to get disposed
 
@@ -94,15 +91,6 @@ namespace Chisel.Core
 				decalTargets                = new NativeList<ChiselDecalTarget>(16, Allocator.Persistent);
 				decalVolumeTargets          = new NativeList<ChiselDecalTarget>(16, Allocator.Persistent);
 				changedDecalBounds          = new NativeList<MinMaxAABB>(16, Allocator.Persistent);
-
-				parameters = new NativeArray<ChiselLayerParameters>(SurfaceDestinationParameters.ParameterCount, Allocator.Persistent); // Confirmed to get disposed
-				for (int i = 0; i < parameters.Length; i++)
-                {
-                    var parameter = parameters[i];
-                    parameter.Initialize(); 
-                    Debug.Assert(parameter.IsCreated);
-                    parameters[i] = parameter;
-                }
             }
 
             internal void EnsureCapacity(int brushCount)
@@ -112,9 +100,6 @@ namespace Chisel.Core
 
                 if (brushIDValues.Capacity < brushCount)
                     brushIDValues.Capacity = brushCount;
-
-                if (allKnownBrushMeshIndices.Capacity < brushCount)
-                    allKnownBrushMeshIndices.Capacity = brushCount;
 
                 if (basePolygonCache.Capacity < brushCount)
                     basePolygonCache.Capacity = brushCount;
@@ -150,12 +135,6 @@ namespace Chisel.Core
             internal void Dispose()
             {
                 // Confirmed to be called
-                if (allKnownBrushMeshIndices.IsCreated)
-                {
-                    allKnownBrushMeshIndices.Clear();
-                    allKnownBrushMeshIndices.Dispose();
-                }
-                allKnownBrushMeshIndices = default;
                 if (brushIDValues.IsCreated)
                     brushIDValues.Dispose();
                 brushIDValues = default;
@@ -326,18 +305,6 @@ namespace Chisel.Core
                     brushRenderBufferLookup.Dispose();
                 brushRenderBufferLookup = default;
                 builtExact = false;
-                if (parameters.IsCreated)
-				{
-					// Confirmed to be called
-					for (int i = 0; i < parameters.Length; i++)
-                    {
-                        if (parameters[i].IsCreated)
-							parameters[i].Dispose();
-                        parameters[i] = default;
-                    }
-                    parameters.Dispose();
-                }
-                parameters = default;
             }
         }
 

@@ -253,7 +253,7 @@ namespace Chisel.Core
             var needles = new NativeList<Needle>(Allocator.Temp);
             for (int b = 0; b < brushes.Length; b++)
             {
-                if (!brushes[b].brushRenderBuffer.IsCreated)
+                if (!brushes[b].brushRenderBuffer.IsCreated || !state.scope.Touches(b))
                     continue;
                 ref var surfaces = ref brushes[b].brushRenderBuffer.Value.surfaces;
                 for (int s = 0; s < surfaces.Length; s++)
@@ -267,12 +267,12 @@ namespace Chisel.Core
                 }
             }
 
-            // What each brush's output spans, to find the brushes a long edge can lie on
+            // What each brush's output spans, to find the brushes a long edge can lie on (FindAcross looks at no other)
             var bounds = new NativeArray<MinMaxAABB>(brushes.Length, Allocator.Temp);
             for (int b = 0; b < brushes.Length; b++)
             {
                 var box = new MinMaxAABB { Min = new float3(float.PositiveInfinity), Max = new float3(float.NegativeInfinity) };
-                if (brushes[b].brushRenderBuffer.IsCreated)
+                if (brushes[b].brushRenderBuffer.IsCreated && state.scope.Touches(b))
                 {
                     ref var surfaces = ref brushes[b].brushRenderBuffer.Value.surfaces;
                     for (int s = 0; s < surfaces.Length; s++)

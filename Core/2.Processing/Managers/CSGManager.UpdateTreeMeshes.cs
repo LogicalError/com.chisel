@@ -1549,7 +1549,9 @@ namespace Chisel.Core
                 #endregion
 
                 #region Fixup brush cache data order
-                // Fix up brush order index in cache data (ordering of brushes may have changed)
+                // Fix up brush order index in cache data (ordering of brushes may have changed); when no brush was removed
+                // or moved (CacheRemappingJob), every cached order is what it is, and every touched-by list is sorted
+                if (brushListChanged)
                 using (kJob_FixupBrushCacheIndicesJobProfilerMarker.Auto())
                 {
                     const bool runInParallel = runInParallelDefault;

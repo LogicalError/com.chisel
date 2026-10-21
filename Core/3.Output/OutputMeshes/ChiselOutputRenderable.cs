@@ -1,9 +1,11 @@
 using Unity.Jobs;
 using Unity.Collections;
+using Unity.Collections.LowLevel.Unsafe;
 using UnityEngine;
 using UnityEngine.Rendering;
 using Unity.Mathematics;
 using Unity.Burst;
+using Unity.Entities;
 using System.Runtime.CompilerServices;
 
 namespace Chisel.Core
@@ -88,15 +90,33 @@ namespace Chisel.Core
 
         [GenerateTestsForBurstCompatibility]
 		public void CopyMesh([NoAlias, ReadOnly] NativeArray<VertexAttributeDescriptor> descriptors,
-					         [NoAlias, ReadOnly] SubMeshSection subMeshSection, 
+					         [NoAlias, ReadOnly] SubMeshSection subMeshSection,
 					         [NoAlias, ReadOnly] SubMeshSource subMeshSource,
                              [NoAlias] ref Mesh.MeshData meshData)
+        {
+            var ranges = new NativeList<RenderCopyRange>(Allocator.Temp);
+            var chunks = new NativeList<int2>(Allocator.Temp);
+            Prepare(descriptors, subMeshSection, subMeshSource, ref meshData, 0, ranges, chunks);
+            chunks.Dispose();
+            for (int r = 0; r < ranges.Length; r++)
+                CopyRange(ranges[r]);
+            ranges.Dispose();
+        }
+
+        // The mesh made ready to be copied into: its buffers, its sub-meshes and its lightmap layout, and a range per
+        // surface (CopyRange, each independent of the others), in chunks of about kChunkVertices (start, end of ranges):
+        // a thread a chunk, as more threads only fight over the mesh's fresh memory
+        public const int kChunkVertices = 32768;
+        public static unsafe void Prepare([NoAlias, ReadOnly] NativeArray<VertexAttributeDescriptor> descriptors,
+					               [NoAlias, ReadOnly] SubMeshSection subMeshSection,
+					               [NoAlias, ReadOnly] SubMeshSource subMeshSource,
+                                   [NoAlias] ref Mesh.MeshData meshData, int meshIndex, NativeList<RenderCopyRange> ranges, NativeList<int2> chunks)
         {
             var startIndex          = subMeshSection.startIndex;
             var endIndex            = subMeshSection.endIndex;
             var numberOfSubMeshes   = endIndex - startIndex;
             var totalVertexCount    = subMeshSection.totalVertexCount;
-            var totalIndexCount     = subMeshSection.totalIndexCount;            
+            var totalIndexCount     = subMeshSection.totalIndexCount;
             if (numberOfSubMeshes == 0 ||
                 totalVertexCount == 0 ||
                 totalIndexCount == 0)
@@ -111,10 +131,13 @@ namespace Chisel.Core
             meshData.SetIndexBufferParams(totalIndexCount, IndexFormat.UInt32);
             meshData.subMeshCount = numberOfSubMeshes;
 
-            var vertices    = meshData.GetVertexData<RenderVertex>(stream: 0);
             var indices     = meshData.GetIndexData<int>();
+            var vertices    = meshData.GetVertexData<RenderVertex>(stream: 0);
             var indexBufferLength  = indices.Length;
             var vertexBufferLength = vertices.Length;
+            // the ranges write through these, so no copy asks the mesh for its buffers again
+            var indexPointer  = (int*)NativeArrayUnsafeUtility.GetUnsafePtr(indices);
+            var vertexPointer = (RenderVertex*)NativeArrayUnsafeUtility.GetUnsafePtr(vertices);
             // The lightmap layout of this mesh: a chart per surface, in the order they are copied below (LightmapUVLayout)
             var chartCount = 0;
             for (int d = startIndex; d < endIndex; d++)
@@ -144,6 +167,8 @@ namespace Chisel.Core
 
             int currentBaseVertex   = 0;
             int currentBaseIndex    = 0;
+            var chunkStart          = ranges.Length;
+            var chunkVertices       = 0;
 
             for (int subMeshIndex = 0, d = startIndex; d < endIndex; d++, subMeshIndex++)
             {
@@ -161,11 +186,11 @@ namespace Chisel.Core
                     Max = new float3(float.NegativeInfinity, float.NegativeInfinity, float.NegativeInfinity)
                 };
 
-                // copy all the vertices & indices to the sub-meshes, one sub-mesh per material
+                // where each surface's vertices & indices go in the sub-meshes, one sub-mesh per material
                 int writtenIndexCount = 0;
-                for (int surfaceIndex       = surfacesOffset, 
-                         indexOffset        = currentBaseIndex, 
-                         indexVertexOffset  = 0, 
+                for (int surfaceIndex       = surfacesOffset,
+                         indexOffset        = currentBaseIndex,
+                         indexVertexOffset  = 0,
                          lastSurfaceIndex   = surfacesCount + surfacesOffset;
 
                          surfaceIndex < lastSurfaceIndex;
@@ -174,19 +199,15 @@ namespace Chisel.Core
                 {
                     var subMeshSurface      = subMeshSurfaceArray[surfaceIndex];
                     ref var sourceBuffer    = ref subMeshSurface.brushRenderBuffer.Value.surfaces[subMeshSurface.surfaceIndex];
-                            
-                    ref var sourceIndices   = ref sourceBuffer.indices;
-                    ref var sourceVertices  = ref sourceBuffer.renderVertices;
 
-                    var sourceIndexCount    = sourceIndices.Length;
-                    var sourceVertexCount   = sourceVertices.Length;
+                    var sourceIndexCount    = sourceBuffer.indices.Length;
+                    var sourceVertexCount   = sourceBuffer.renderVertices.Length;
 
                     if (sourceIndexCount == 0 ||
                         sourceVertexCount == 0)
                         continue;
 
-                    // Ask BEFORE writing - the [BurstDiscard] validation below never runs inside the
-                    // job, and by the time it would, the buffer has already been overrun.
+                    // Ask BEFORE writing - the buffer would be overrun
                     if (!ChiselOutputMeshValidation.FitsInBuffer(indexOffset, sourceIndexCount, indexBufferLength) ||
                         !ChiselOutputMeshValidation.FitsInBuffer(currentBaseVertex + indexVertexOffset, sourceVertexCount, vertexBufferLength))
                     {
@@ -194,33 +215,40 @@ namespace Chisel.Core
                         break;
                     }
 
-                    for (int i = 0; i < sourceIndexCount; i++)
-                        indices[i + indexOffset] = (int)(sourceIndices[i] + indexVertexOffset) + currentBaseVertex;
-                    indexOffset += sourceIndexCount;
-                    writtenIndexCount += sourceIndexCount;
-
-                    vertices.CopyFrom(currentBaseVertex + indexVertexOffset, ref sourceVertices, 0, sourceVertexCount);
                     // Where its lightmap coordinates go in this mesh's layout
                     var chartIndex = chartBase + (surfaceIndex - surfacesOffset);
-                    var placement  = placements[chartIndex];
-                    var chartRect  = charts[chartIndex].rect;
-                    for (int v = currentBaseVertex + indexVertexOffset, lastVertex = v + sourceVertexCount; v < lastVertex; v++)
+                    ranges.Add(new RenderCopyRange
                     {
-                        var vertex = vertices[v];
-                        vertex.uv1 = placement.Place(vertex.uv1, chartRect) * lightmapScale;
-                        vertices[v] = vertex;
+                        meshIndex     = meshIndex,
+                        indices       = indexPointer,
+                        vertices      = vertexPointer,
+                        buffer        = subMeshSurface.brushRenderBuffer,
+                        surfaceIndex  = subMeshSurface.surfaceIndex,
+                        baseVertex    = currentBaseVertex + indexVertexOffset,
+                        baseIndex     = indexOffset,
+                        placement     = placements[chartIndex],
+                        chartRect     = charts[chartIndex].rect,
+                        lightmapScale = lightmapScale
+                    });
+                    chunkVertices += sourceVertexCount;
+                    if (chunkVertices >= kChunkVertices)
+                    {
+                        chunks.Add(new int2(chunkStart, ranges.Length));
+                        chunkStart = ranges.Length;
+                        chunkVertices = 0;
                     }
+                    indexOffset += sourceIndexCount;
+                    writtenIndexCount += sourceIndexCount;
 
 					aabb.Min = math.min(aabb.Min, sourceBuffer.aabb.Min);
 					aabb.Max = math.max(aabb.Max, sourceBuffer.aabb.Max);
 
                     indexVertexOffset += sourceVertexCount;
                 }
-                
+
                 for (int z = currentBaseIndex + writtenIndexCount; z < currentBaseIndex + indexCount && z < indexBufferLength; z++)
                     indices[z] = 0;
 
-                ChiselOutputMeshValidation.ValidateSubMeshIndices(indices, currentBaseIndex, indexCount, totalVertexCount, subMeshIndex);
                 meshData.SetSubMesh(subMeshIndex, new SubMeshDescriptor
                 {
                     baseVertex  = 0,//currentBaseVertex,
@@ -236,10 +264,44 @@ namespace Chisel.Core
                 currentBaseIndex += indexCount;
                 chartBase += surfacesCount;
             }
+            if (ranges.Length > chunkStart)
+                chunks.Add(new int2(chunkStart, ranges.Length));
             charts.Dispose();
             placements.Dispose();
         }
+
+        // One surface's indices and vertices copied to where Prepare put them, its lightmap coordinates placed
+        public static unsafe void CopyRange(RenderCopyRange range)
+        {
+            var vertices = range.vertices;
+            var indices  = range.indices;
+            ref var source = ref range.buffer.Value.surfaces[range.surfaceIndex];
+            ref var sourceIndices  = ref source.indices;
+            ref var sourceVertices = ref source.renderVertices;
+            for (int i = 0; i < sourceIndices.Length; i++)
+                indices[range.baseIndex + i] = sourceIndices[i] + range.baseVertex;
+            for (int v = 0; v < sourceVertices.Length; v++)
+            {
+                var vertex = sourceVertices[v];
+                vertex.uv1 = range.placement.Place(vertex.uv1, range.chartRect) * range.lightmapScale;
+                vertices[range.baseVertex + v] = vertex;
+            }
+        }
 	}
+
+    // Where one surface of a render mesh goes, and how its lightmap coordinates are placed (ChiselOutputRenderable.Prepare)
+    internal unsafe struct RenderCopyRange
+    {
+        public int    meshIndex;
+        [NativeDisableUnsafePtrRestriction] public int*          indices;
+        [NativeDisableUnsafePtrRestriction] public RenderVertex* vertices;
+        public BlobAssetReference<ChiselBrushRenderBuffer> buffer;
+        public int    surfaceIndex;
+        public int    baseVertex, baseIndex;
+        public LightmapChartPlacement placement;
+        public float4 chartRect;
+        public float  lightmapScale;
+    }
 
 
 	internal struct ChiselOutputCollidable : IChiselOutputMeshCopier

@@ -3,6 +3,7 @@ using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
 using Unity.Entities;
 using Unity.Jobs;
+using Unity.Mathematics;
 using UnityEngine;
 using UnityEngine.Rendering;
 using Debug = UnityEngine.Debug;
@@ -250,6 +251,49 @@ namespace Chisel.Core
 		}
     }
     
+    // The render meshes made ready, one after another, and where each surface goes (ChiselOutputRenderable.Prepare)
+    [BurstCompile(CompileSynchronously = true, OptimizeFor = OptimizeFor.Performance)]
+    struct PrepareRenderCopiesJob : IJob
+	{
+        // Read
+		[NoAlias, ReadOnly] public NativeArray<VertexAttributeDescriptor> descriptors;
+        [NoAlias, ReadOnly] public NativeList<ChiselMeshUpdate> meshUpdates;
+		[NoAlias, ReadOnly] public SubMeshSource subMeshSource;
+
+		// Write
+		[NativeDisableContainerSafetyRestriction] public Mesh.MeshDataArray meshDataArray;
+        [NoAlias] public NativeList<RenderCopyRange> ranges;
+        [NoAlias] public NativeList<int2> chunks;
+
+        public void Execute()
+        {
+            ranges.Clear();
+            chunks.Clear();
+            for (int i = 0; i < meshUpdates.Length; i++)
+            {
+                var update   = meshUpdates[i];
+                var meshData = meshDataArray[update.meshIndex];
+                ChiselOutputRenderable.Prepare(descriptors, update.subMeshSection, subMeshSource, ref meshData, update.meshIndex, ranges, chunks);
+            }
+		}
+    }
+
+    // The render meshes' surfaces copied, a chunk of them at a time
+    [BurstCompile(CompileSynchronously = true, OptimizeFor = OptimizeFor.Performance)]
+    struct RenderCopyRangesJob : IJobParallelForDefer
+	{
+        [NoAlias, ReadOnly] public NativeArray<RenderCopyRange> ranges;
+        [NoAlias, ReadOnly] public NativeArray<int2> chunks;
+		// what the ranges write into
+		[NativeDisableContainerSafetyRestriction] public Mesh.MeshDataArray meshDataArray;
+
+        public void Execute(int index)
+        {
+            for (int r = chunks[index].x; r < chunks[index].y; r++)
+                ChiselOutputRenderable.CopyRange(ranges[r]);
+		}
+    }
+
 	[BurstCompile(CompileSynchronously = true)]
 	struct AllocateVertexBuffersJob : IJob
 	{

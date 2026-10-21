@@ -369,12 +369,14 @@ namespace Chisel.Core
         [NoAlias] public FindState       hotspotFind;
         // what the last update's grouping found, kept with the tree
         [NoAlias] public HotspotGroupMemory hotspotGroupMemory;
+        // the brushes whose kinds were kept (HotspotStageMemory.keptKinds)
+        [NoAlias, ReadOnly] public NativeList<bool> keptBrushes;
         public bool verify;
 
         public void Execute()
         {
             HotspotGroups.Borders(brushRenderData, hotspotLinks, ref hotspotCut.bordersOf);
-            HotspotGroups.PrepareIncremental(brushRenderData, hotspotTiles, hotspotLayouts, hotspotLinks, ref hotspotFind, ref hotspotGroupMemory);
+            HotspotGroups.PrepareIncremental(brushRenderData, hotspotTiles, hotspotLayouts, hotspotLinks, ref hotspotFind, ref hotspotGroupMemory, keptBrushes.AsArray());
             if (verify)
             {
                 var full = FindState.Create(Allocator.Temp);

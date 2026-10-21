@@ -138,6 +138,60 @@ namespace Chisel.Core
         public override readonly int GetHashCode() => (int)math.hash(new uint2(brush.Hash(), (uint)surface));
     }
 
+    // Each candidate's index by its key: its brush by node id, then flat by the brush's first surface
+    internal struct CandidateIndex
+    {
+        UnsafeHashMap<CompactNodeID, int> brushOf;
+        UnsafeList<int> surfaceStart;
+        UnsafeList<int> at;
+        public int Count;
+
+        public CandidateIndex(NativeList<BrushData> brushes, NativeArray<int2> candidates, Allocator allocator)
+        {
+            brushOf      = new UnsafeHashMap<CompactNodeID, int>(math.max(1, brushes.Length), allocator);
+            surfaceStart = new UnsafeList<int>(brushes.Length + 1, allocator);
+            var total = 0;
+            for (int b = 0; b < brushes.Length; b++)
+            {
+                brushOf.TryAdd(brushes[b].brushIndexOrder.compactNodeID, b);
+                surfaceStart.Add(total);
+                total += brushes[b].brushRenderBuffer.IsCreated ? brushes[b].brushRenderBuffer.Value.surfaces.Length : 0;
+            }
+            surfaceStart.Add(total);
+            at = new UnsafeList<int>(math.max(1, total), allocator);
+            at.Resize(total);
+            for (int i = 0; i < total; i++)
+                at[i] = -1;
+            Count = 0;
+            for (int c = 0; c < candidates.Length; c++)
+            {
+                var index = surfaceStart[candidates[c].x] + candidates[c].y;
+                if (at[index] >= 0)
+                    continue;
+                at[index] = c;
+                Count++;
+            }
+        }
+
+        public readonly bool HasBrush(CompactNodeID brush) => brushOf.ContainsKey(brush);
+
+        public readonly bool TryGetValue(SurfaceKey key, out int candidate)
+        {
+            candidate = -1;
+            if (!brushOf.TryGetValue(key.brush, out var b) || key.surface < 0 || key.surface >= surfaceStart[b + 1] - surfaceStart[b])
+                return false;
+            candidate = at[surfaceStart[b] + key.surface];
+            return candidate >= 0;
+        }
+
+        public readonly bool ContainsKey(SurfaceKey key) => TryGetValue(key, out _);
+
+        public void Dispose()
+        {
+            brushOf.Dispose(); surfaceStart.Dispose(); at.Dispose();
+        }
+    }
+
     // A candidate as the last update grouped it
     internal struct KeptCandidate
     {
@@ -157,8 +211,9 @@ namespace Chisel.Core
         public NativeParallelMultiHashMap<float3, SurfaceKey> cornerIndex;
         // the lead of each group of two or more -> its members (the lead among them)
         public NativeParallelMultiHashMap<SurfaceKey, SurfaceKey> members;
-        // the brushes, in order; what every candidate's grouping reads (GroupInputsKey)
+        // the brushes, in order, and how many surfaces each had; what every candidate's grouping reads (GroupInputsKey)
         public NativeList<CompactNodeID> order;
+        public NativeParallelHashMap<CompactNodeID, int> surfaceCount;
         public NativeReference<uint4> inputs;
         public NativeReference<bool> valid;
         // what the last update did: grouped everything again (full), or this many candidates (dirty)
@@ -173,6 +228,7 @@ namespace Chisel.Core
                 cornerIndex = new NativeParallelMultiHashMap<float3, SurfaceKey>(256, allocator),
                 members     = new NativeParallelMultiHashMap<SurfaceKey, SurfaceKey>(64, allocator),
                 order       = new NativeList<CompactNodeID>(64, allocator),
+                surfaceCount = new NativeParallelHashMap<CompactNodeID, int>(64, allocator),
                 inputs      = new NativeReference<uint4>(allocator),
                 valid       = new NativeReference<bool>(allocator),
                 lastFull    = new NativeReference<bool>(allocator),
@@ -191,6 +247,7 @@ namespace Chisel.Core
             cornerIndex.Clear();
             members.Clear();
             order.Clear();
+            surfaceCount.Clear();
             valid.Value = false;
         }
 
@@ -208,6 +265,7 @@ namespace Chisel.Core
             if (cornerIndex.IsCreated) cornerIndex.Dispose();
             if (members.IsCreated)     members.Dispose();
             if (order.IsCreated)       order.Dispose();
+            if (surfaceCount.IsCreated) surfaceCount.Dispose();
             if (inputs.IsCreated)      inputs.Dispose();
             if (valid.IsCreated)       valid.Dispose();
             if (lastFull.IsCreated)    lastFull.Dispose();
@@ -503,8 +561,9 @@ namespace Chisel.Core
 
         // Prepare, grouping again only the candidates the edits since the last update can have changed the groups of
         // (IncrementalHotspotGroups.md): its result is Prepare's. memory: what the last update found, kept with the tree.
+        // keptBrushes: the brushes whose kinds and hashes are the last update's (HotspotStageMemory.keptKinds; none when not given)
         public static void PrepareIncremental(NativeList<BrushData> brushes, NativeArray<HotspotTileData> tiles, NativeArray<HotspotLayoutData> layouts,
-                                              NativeArray<HotspotLink> links, ref FindState state, ref HotspotGroupMemory memory)
+                                              NativeArray<HotspotLink> links, ref FindState state, ref HotspotGroupMemory memory, NativeArray<bool> keptBrushes = default)
         {
             state.Clear();
             memory.lastFull.Value  = true;
@@ -529,14 +588,16 @@ namespace Chisel.Core
             var inputs = GroupInputsKey(layouts, links);
             var root   = new NativeArray<int>(count, Allocator.Temp);
             var unfold = new NativeArray<float4x4>(count, Allocator.Temp);
-            var indexOf  = new UnsafeHashMap<SurfaceKey, int>(math.max(1, count), Allocator.Temp);
+            var indexOf  = new CandidateIndex(brushes, candidates.AsArray(), Allocator.Temp);
             var dirty    = new NativeArray<bool>(count, Allocator.Temp);
             var newCorners = new NativeArray<UnsafeList<float3>>(count, Allocator.Temp);
-            for (int c = 0; c < count; c++)
-                indexOf.TryAdd(keys[c], c);
+            var gone     = new NativeList<SurfaceKey>(16, Allocator.Temp);
             var full = !memory.valid.Value || !memory.inputs.Value.Equals(inputs) || indexOf.Count != count || !SameOrder(brushes, memory.order);
             if (!full)
-                full = !Regroup(brushes, candidates.AsArray(), firstSliver, links, keys, hashes, indexOf, dirty, newCorners, root, unfold, ref memory);
+            {
+                GoneCandidates(brushes, keptBrushes, indexOf, ref memory, gone);
+                full = !Regroup(brushes, candidates.AsArray(), firstSliver, links, keys, hashes, indexOf, keptBrushes, gone, dirty, newCorners, root, unfold, ref memory);
+            }
             if (full)
             {
                 for (int c = 0; c < count; c++)
@@ -550,13 +611,13 @@ namespace Chisel.Core
             }
             if (count >= 2)
                 Compose(candidates.AsArray(), root, unfold, ref state);
-            Remember(full, brushes, candidates.AsArray(), keys, hashes, indexOf, dirty, newCorners, root, unfold, inputs, ref memory);
+            Remember(full, brushes, candidates.AsArray(), keys, hashes, gone, dirty, newCorners, root, unfold, inputs, ref memory);
             for (int c = 0; c < count; c++)
             {
                 if (newCorners[c].IsCreated)
                     newCorners[c].Dispose();
             }
-            newCorners.Dispose(); dirty.Dispose(); indexOf.Dispose(); unfold.Dispose(); root.Dispose(); hashes.Dispose(); keys.Dispose();
+            newCorners.Dispose(); dirty.Dispose(); indexOf.Dispose(); gone.Dispose(); unfold.Dispose(); root.Dispose(); hashes.Dispose(); keys.Dispose();
             candidates.Dispose();
         }
 
@@ -595,12 +656,42 @@ namespace Chisel.Core
             return corners;
         }
 
+        // The kept candidates that are not candidates any more: a kept brush has the candidates it had, so only the other
+        // brushes' surfaces, and those of the brushes that are gone, are looked at
+        static void GoneCandidates(NativeList<BrushData> brushes, NativeArray<bool> keptBrushes, in CandidateIndex indexOf, ref HotspotGroupMemory memory,
+                                   NativeList<SurfaceKey> gone)
+        {
+            for (int b = 0; b < brushes.Length; b++)
+            {
+                if (keptBrushes.IsCreated && b < keptBrushes.Length && keptBrushes[b])
+                    continue;
+                GoneOf(brushes[b].brushIndexOrder.compactNodeID, indexOf, ref memory, gone);
+            }
+            for (int i = 0; i < memory.order.Length; i++)
+            {
+                if (!indexOf.HasBrush(memory.order[i]))
+                    GoneOf(memory.order[i], indexOf, ref memory, gone);
+            }
+        }
+
+        static void GoneOf(CompactNodeID brush, in CandidateIndex indexOf, ref HotspotGroupMemory memory, NativeList<SurfaceKey> gone)
+        {
+            if (!memory.surfaceCount.TryGetValue(brush, out var surfaces))
+                return;
+            for (int s = 0; s < surfaces; s++)
+            {
+                var key = new SurfaceKey { brush = brush, surface = s };
+                if (memory.candidates.ContainsKey(key) && !indexOf.ContainsKey(key))
+                    gone.Add(key);
+            }
+        }
+
         // The dirty candidates (changed, their neighbours, their kept groups, the neighbours of their slivers) grouped
         // again; the others as they were kept. False when that is not to be done (most of the model is dirty, or what is
         // kept does not hold together): everything is grouped again then.
         static bool Regroup(NativeList<BrushData> brushes, NativeArray<int2> candidates, int firstSliver, NativeArray<HotspotLink> links,
-                            NativeArray<SurfaceKey> keys, NativeArray<uint4> hashes, UnsafeHashMap<SurfaceKey, int> indexOf, NativeArray<bool> dirty,
-                            NativeArray<UnsafeList<float3>> newCorners, NativeArray<int> root, NativeArray<float4x4> unfold, ref HotspotGroupMemory memory)
+                            NativeArray<SurfaceKey> keys, NativeArray<uint4> hashes, in CandidateIndex indexOf, NativeArray<bool> keptBrushes, NativeList<SurfaceKey> gone,
+                            NativeArray<bool> dirty, NativeArray<UnsafeList<float3>> newCorners, NativeArray<int> root, NativeArray<float4x4> unfold, ref HotspotGroupMemory memory)
         {
             var count  = candidates.Length;
             var kept   = memory.candidates;
@@ -608,7 +699,7 @@ namespace Chisel.Core
             var groups = memory.members;
             var queue  = new NativeList<int>(64, Allocator.Temp);
             var changed = new NativeList<int>(16, Allocator.Temp);
-            var gone    = new NativeList<SurfaceKey>(16, Allocator.Temp);
+            var candidateIndex = indexOf;
             try
             {
                 void Mark(int c)
@@ -620,7 +711,7 @@ namespace Chisel.Core
                 }
                 void MarkKey(SurfaceKey key)
                 {
-                    if (indexOf.TryGetValue(key, out var c))
+                    if (candidateIndex.TryGetValue(key, out var c))
                         Mark(c);
                 }
                 void MarkGroupOf(SurfaceKey key)
@@ -643,16 +734,13 @@ namespace Chisel.Core
                     }
                 }
 
-                // what changed: new, different, gone
+                // what changed: new, different (a kept brush's candidates are what they were); gone (GoneCandidates)
                 for (int c = 0; c < count; c++)
                 {
+                    if (keptBrushes.IsCreated && keptBrushes[candidates[c].x])
+                        continue;
                     if (!kept.TryGetValue(keys[c], out var was) || !was.hash.Equals(hashes[c]))
                         changed.Add(c);
-                }
-                foreach (var pair in kept)
-                {
-                    if (!indexOf.ContainsKey(pair.Key))
-                        gone.Add(pair.Key);
                 }
                 if (changed.Length == 0 && gone.Length == 0)
                 {
@@ -789,13 +877,13 @@ namespace Chisel.Core
             }
             finally
             {
-                queue.Dispose(); changed.Dispose(); gone.Dispose();
+                queue.Dispose(); changed.Dispose();
             }
         }
 
         // What this update found, kept for the next: everything again (full), or the dirty candidates and the gone ones
         static void Remember(bool full, NativeList<BrushData> brushes, NativeArray<int2> candidates, NativeArray<SurfaceKey> keys, NativeArray<uint4> hashes,
-                             UnsafeHashMap<SurfaceKey, int> indexOf, NativeArray<bool> dirty, NativeArray<UnsafeList<float3>> newCorners, NativeArray<int> root, NativeArray<float4x4> unfold,
+                             NativeList<SurfaceKey> gone, NativeArray<bool> dirty, NativeArray<UnsafeList<float3>> newCorners, NativeArray<int> root, NativeArray<float4x4> unfold,
                              uint4 inputs, ref HotspotGroupMemory memory)
         {
             var count = candidates.Length;
@@ -816,21 +904,13 @@ namespace Chisel.Core
             } else
             {
                 // the gone ones
-                using (var gone = new NativeList<SurfaceKey>(16, Allocator.Temp))
+                for (int i = 0; i < gone.Length; i++)
                 {
-                    foreach (var pair in memory.candidates)
-                    {
-                        if (!indexOf.ContainsKey(pair.Key))
-                            gone.Add(pair.Key);
-                    }
-                    for (int i = 0; i < gone.Length; i++)
-                    {
-                        var was = memory.candidates[gone[i]];
-                        memory.members.Remove(was.lead);
-                        if (was.corners.IsCreated)
-                            was.corners.Dispose();
-                        memory.candidates.Remove(gone[i]);
-                    }
+                    var was = memory.candidates[gone[i]];
+                    memory.members.Remove(was.lead);
+                    if (was.corners.IsCreated)
+                        was.corners.Dispose();
+                    memory.candidates.Remove(gone[i]);
                 }
                 // the dirty ones' old groups (all of them dirty) forgotten, then everything they are now
                 for (int c = 0; c < count; c++)
@@ -863,8 +943,12 @@ namespace Chisel.Core
             }
             size.Dispose();
             memory.order.Clear();
+            memory.surfaceCount.Clear();
             for (int b = 0; b < brushes.Length; b++)
+            {
                 memory.order.Add(brushes[b].brushIndexOrder.compactNodeID);
+                memory.surfaceCount.TryAdd(brushes[b].brushIndexOrder.compactNodeID, brushes[b].brushRenderBuffer.IsCreated ? brushes[b].brushRenderBuffer.Value.surfaces.Length : 0);
+            }
             memory.inputs.Value = inputs;
             memory.valid.Value  = true;
         }

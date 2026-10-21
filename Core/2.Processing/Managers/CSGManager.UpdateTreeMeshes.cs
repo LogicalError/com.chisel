@@ -2601,6 +2601,7 @@ namespace Chisel.Core
                         hotspotCut           = Temporaries.hotspotCut,
                         hotspotFind          = Temporaries.hotspotFind,
                         hotspotGroupMemory   = chiselLookupValues.hotspotGroupMemory,
+                        keptBrushes          = chiselLookupValues.hotspotStageMemory.keptKinds,
                         verify               = HotspotGroups.VerifyIncremental
                     };
                     prepareHotspotGroupsJob.Schedule(runInParallel,

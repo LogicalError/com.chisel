@@ -610,6 +610,8 @@ namespace Chisel.Core
                     continue;
                 }
                 var flags = brushes[mine.x].brushRenderBuffer.Value.surfaces[mine.y].destinationFlags;
+                // of the triangles facing it, the one keyed last: the choice depends on the triangles, not on the map
+                var best = -1;
                 do
                 {
                     if (j == i || opposites.gone[j])
@@ -622,17 +624,18 @@ namespace Chisel.Core
                         opposites.gone[j] = true;
                         continue;
                     }
-                    // two facing needles are WeldNeedles' to drop
-                    if (OutputWeld.OnOneLine(math.asfloat(key.a), math.asfloat(key.b), math.asfloat(key.c)))
-                        break;
-                    Drop(brushes, work, workIndex, mine.x, mine.y, mine.z);
-                    Drop(brushes, work, workIndex, other.x, other.y, other.z);
-                    opposites.gone[i] = true;
-                    opposites.gone[j] = true;
-                    cancelled++;
-                    changed = true;
-                    break;
+                    best = math.max(best, j);
                 } while (opposites.byKey.TryGetNextValue(out j, ref iterator));
+                // two facing needles are WeldNeedles' to drop
+                if (best < 0 || OutputWeld.OnOneLine(math.asfloat(key.a), math.asfloat(key.b), math.asfloat(key.c)))
+                    continue;
+                var facing = opposites.found[best];
+                Drop(brushes, work, workIndex, mine.x, mine.y, mine.z);
+                Drop(brushes, work, workIndex, facing.x, facing.y, facing.z);
+                opposites.gone[i] = true;
+                opposites.gone[best] = true;
+                cancelled++;
+                changed = true;
             }
             return changed;
         }

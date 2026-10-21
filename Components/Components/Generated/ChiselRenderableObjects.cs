@@ -809,7 +809,7 @@ namespace Chisel.Components
 				var gameObjectState = gameObjectStates[objectUpdate.model];
                 var expectedEnabled = !instance.debugVisualizationRenderer &&
 					vertexBufferContents.subMeshTriangleLookups[contentsIndex].IsCreated && 
-					vertexBufferContents.subMeshTriangleLookups[contentsIndex].Value.perTriangleNodeIDLookup.Length > 0;
+					vertexBufferContents.subMeshTriangleLookups[contentsIndex].Value.triangleCount > 0;
                 if (instance.meshRenderer.enabled != expectedEnabled)
                     instance.meshRenderer.enabled = expectedEnabled;
 

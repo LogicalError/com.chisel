@@ -836,7 +836,10 @@ namespace Chisel.Core
                 brush.dirty = false;
                 var data = brushes[b];
                 if (brush.output.IsCreated)
+                {
+                    KeepHotspotGroups(data.brushRenderBuffer, brush.output);
                     data.brushRenderBuffer = brush.output;
+                }
                 brushes[b] = data;
             }
 
@@ -887,6 +890,19 @@ namespace Chisel.Core
             finally
             {
                 state.Dispose();
+            }
+        }
+
+        // What the hotspot cut writes into a brush's own buffer in place (OutputHotspotSections.StartCutKeys), as Copy
+        // would have copied it
+        static void KeepHotspotGroups(BlobAssetReference<ChiselBrushRenderBuffer> input, BlobAssetReference<ChiselBrushRenderBuffer> output)
+        {
+            ref var from = ref input.Value.surfaces;
+            ref var to   = ref output.Value.surfaces;
+            for (int s = 0; s < from.Length && s < to.Length; s++)
+            {
+                to[s].hotspot.group           = from[s].hotspot.group;
+                to[s].hotspot.groupVariations = from[s].hotspot.groupVariations;
             }
         }
 

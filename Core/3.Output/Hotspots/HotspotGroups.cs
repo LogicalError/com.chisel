@@ -1343,9 +1343,12 @@ namespace Chisel.Core
                 {
                     group.sectionStart = new int3(lines.Length, halfPlanes.Length, cells.Length);
                     group.sectionCount = new int3(match.lines.Length, match.halfPlanes.Length, match.cells.Length);
-                    for (int k = 0; k < match.lines.Length; k++)      lines.Add(match.lines[k]);
-                    for (int k = 0; k < match.halfPlanes.Length; k++) halfPlanes.Add(match.halfPlanes[k]);
-                    for (int k = 0; k < match.cells.Length; k++)      cells.Add(match.cells[k]);
+                    unsafe
+                    {
+                        lines.AddRange(match.lines.Ptr, match.lines.Length);
+                        halfPlanes.AddRange(match.halfPlanes.Ptr, match.halfPlanes.Length);
+                        cells.AddRange(match.cells.Ptr, match.cells.Length);
+                    }
                 }
                 var index = groups.Length;
                 groups.Add(group);

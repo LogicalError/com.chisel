@@ -859,7 +859,7 @@ namespace Chisel.Core
                     var p0 = m0 ? targets[c0] : view.Position(c0);
                     var p1 = m1 ? targets[c1] : view.Position(c1);
                     var p2 = m2 ? targets[c2] : view.Position(c2);
-                    if (!(p0.Equals(p1) || p1.Equals(p2) || p2.Equals(p0) || math.lengthsq(math.cross(p1 - p0, p2 - p0)) == 0))
+                    if (!OutputWeld.WithoutArea(p0, p1, p2))
                         continue;
                     dropped[t] = true;
                     if (decisions != null)

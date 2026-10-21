@@ -2438,6 +2438,7 @@ namespace Chisel.Core
                         meshQueryLength         = Temporaries.meshQueriesLength,
                         allTreeBrushIndexOrders = Temporaries.allTreeBrushIndexOrders,
                         brushRenderBufferCache  = chiselLookupValues.brushRenderBufferCache,
+                        allUpdateBrushIndexOrders = Temporaries.allUpdateBrushIndexOrders,
 
                         // Write
                         brushRenderData      = Temporaries.brushRenderData,
@@ -2445,12 +2446,14 @@ namespace Chisel.Core
                         // Read/Write
                         surfaceCountRef = Temporaries.surfaceCountRef,
                         collapseMoves   = chiselLookupValues.collapseMoves,
-                        weld            = Temporaries.weld
+                        weld            = Temporaries.weld,
+                        weldMemory      = chiselLookupValues.weldMemory
                     };
                     findBrushRenderBuffersJob.Schedule(runInParallel,
                         JobHandles.Read(
                             JobHandleType.meshQueriesJobHandle,
                             JobHandleType.allTreeBrushIndexOrdersJobHandle,
+                            JobHandleType.allUpdateBrushIndexOrdersJobHandle,
                             JobHandleType.brushRenderBufferCacheJobHandle,
                             JobHandleType.decalVolumesJobHandle),   // the hotspot tiles and layouts are disposed with the decals
                         JobHandles.Write(
@@ -2469,6 +2472,7 @@ namespace Chisel.Core
                                 work            = weld.work,
                                 workIndex       = weld.workIndex,
                                 edgeOffsets     = weld.edgeOffsets.AsDeferredJobArray(),
+                                scope           = weld.scope,
                                 edgeCounts      = weld.edgeCounts.AsDeferredJobArray(),
                                 shortPairs      = weld.shortPairs.AsDeferredJobArray(),
                                 keptCorners     = weld.keptCorners.AsDeferredJobArray()
@@ -2476,7 +2480,7 @@ namespace Chisel.Core
                             shortEdgesJob.Schedule(runInParallel, Temporaries.brushRenderData, 16,
                                 JobHandles.Read(JobHandleType.decalVolumesJobHandle),
                                 JobHandles.Write(JobHandleType.brushRenderDataJobHandle));
-                            var stepJob = new CollapseStepJob { step = pass, brushRenderData = Temporaries.brushRenderData, collapseMoves = chiselLookupValues.collapseMoves, weld = weld };
+                            var stepJob = new CollapseStepJob { step = pass, brushRenderData = Temporaries.brushRenderData, collapseMoves = chiselLookupValues.collapseMoves, weld = weld, weldMemory = chiselLookupValues.weldMemory };
                             stepJob.Schedule(runInParallel,
                                 JobHandles.Read(JobHandleType.decalVolumesJobHandle),
                                 JobHandles.Write(JobHandleType.brushRenderDataJobHandle));
@@ -2491,13 +2495,14 @@ namespace Chisel.Core
                                 workIndex       = weld.workIndex,
                                 movedTo         = weld.movedTo,
                                 decisionOffsets = weld.decisionOffsets.AsDeferredJobArray(),
+                                scope           = weld.scope,
                                 decisionCounts  = weld.decisionCounts.AsDeferredJobArray(),
                                 decisions       = weld.decisions.AsDeferredJobArray()
                             };
                             decideJob.Schedule(runInParallel, Temporaries.brushRenderData, 16,
                                 JobHandles.Read(JobHandleType.decalVolumesJobHandle),
                                 JobHandles.Write(JobHandleType.brushRenderDataJobHandle));
-                            var stepJob = new CollapseStepJob { step = 2 + pass, brushRenderData = Temporaries.brushRenderData, collapseMoves = chiselLookupValues.collapseMoves, weld = weld };
+                            var stepJob = new CollapseStepJob { step = 2 + pass, brushRenderData = Temporaries.brushRenderData, collapseMoves = chiselLookupValues.collapseMoves, weld = weld, weldMemory = chiselLookupValues.weldMemory };
                             stepJob.Schedule(runInParallel,
                                 JobHandles.Read(JobHandleType.decalVolumesJobHandle),
                                 JobHandles.Write(JobHandleType.brushRenderDataJobHandle));
@@ -2510,7 +2515,6 @@ namespace Chisel.Core
                         brushRenderData = Temporaries.brushRenderData.AsDeferredJobArray(),
                         work            = Temporaries.weld.work,
                         workIndex       = Temporaries.weld.workIndex,
-                        weldCopyCache   = chiselLookupValues.weldCopyCache,
                         collapseDecisions = Temporaries.weld.decisions,
 
                         // Write
@@ -2530,7 +2534,10 @@ namespace Chisel.Core
                         patchedRenderBuffers = Temporaries.patchedRenderBuffers,
                         hotspotCut           = Temporaries.hotspotCut,
                         hotspotFind          = Temporaries.hotspotFind,
-                        weldCopyCache        = chiselLookupValues.weldCopyCache
+                        weldMemory           = chiselLookupValues.weldMemory,
+                        collapseMoves        = chiselLookupValues.collapseMoves,
+                        verify               = OutputModelWeld.VerifyIncremental,
+                        report               = OutputModelWeld.ReportIncremental
                     };
                     finishWeldJob.Schedule(runInParallel,
                         JobHandles.Read(JobHandleType.decalVolumesJobHandle),

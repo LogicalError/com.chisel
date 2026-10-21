@@ -37,6 +37,8 @@ namespace Chisel.Core
         public NativeParallelHashMap<float3, float3> movedTo;
         public NativeList<int>      decisionCounts, decisionOffsets;
         public NativeList<OutputModelWeld.CollapseDecision> decisions;
+        // the triangles this update welds (OutputModelWeld.PrepareIncremental); all of them unless it says otherwise
+        public WeldScope scope;
 
         public static WeldState Create(Allocator allocator)
         {
@@ -52,7 +54,8 @@ namespace Chisel.Core
                 movedTo         = new NativeParallelHashMap<float3, float3>(16, allocator),
                 decisionCounts  = new NativeList<int>(16, allocator),
                 decisionOffsets = new NativeList<int>(16, allocator),
-                decisions       = new NativeList<OutputModelWeld.CollapseDecision>(16, allocator)
+                decisions       = new NativeList<OutputModelWeld.CollapseDecision>(16, allocator),
+                scope           = WeldScope.Create(allocator)
             };
         }
 
@@ -75,6 +78,7 @@ namespace Chisel.Core
                 if (w.collider.IsCreated) w.collider.Dispose();
                 if (w.select.IsCreated)   w.select.Dispose();
                 if (w.render.IsCreated)   w.render.Dispose();
+                if (w.splitRoots.IsCreated) w.splitRoots.Dispose();
             }
         }
 
@@ -95,6 +99,7 @@ namespace Chisel.Core
             if (decisionCounts.IsCreated)  decisionCounts.Dispose();
             if (decisionOffsets.IsCreated) decisionOffsets.Dispose();
             if (decisions.IsCreated)       decisions.Dispose();
+            scope.Dispose();
         }
 
         public Unity.Jobs.JobHandle Dispose(Unity.Jobs.JobHandle dependency)
@@ -105,7 +110,7 @@ namespace Chisel.Core
             var b = workIndex.IsCreated ? workIndex.Dispose(dependency) : dependency;
             var c = copies.IsCreated    ? copies.Dispose(dependency)    : dependency;
             var d = dependency;
-            var handles = new NativeArray<Unity.Jobs.JobHandle>(10, Allocator.Temp);
+            var handles = new NativeArray<Unity.Jobs.JobHandle>(11, Allocator.Temp);
             handles[0] = Unity.Jobs.JobHandle.CombineDependencies(a, b, c);
             handles[1] = d;
             handles[2] = edgeCounts.IsCreated      ? edgeCounts.Dispose(dependency)      : dependency;
@@ -116,6 +121,7 @@ namespace Chisel.Core
             handles[7] = decisionCounts.IsCreated  ? decisionCounts.Dispose(dependency)  : dependency;
             handles[8] = decisionOffsets.IsCreated ? decisionOffsets.Dispose(dependency) : dependency;
             handles[9] = decisions.IsCreated       ? decisions.Dispose(dependency)       : dependency;
+            handles[10] = scope.Dispose(dependency);
             var all = Unity.Jobs.JobHandle.CombineDependencies(handles);
             handles.Dispose();
             return all;
@@ -129,7 +135,7 @@ namespace Chisel.Core
         public void Execute() { WeldState.FreeWork(work); }
     }
 
-    internal static class OutputModelWeld
+    internal static partial class OutputModelWeld
     {
         // Edges shorter than this are collapsed, the last step across the model: where many planes
         // meet (a sphere's pole) planes snapped one by one meet a fraction of a millimetre apart, which only slivers show
@@ -146,6 +152,8 @@ namespace Chisel.Core
             public UnsafeList<SelectVertex> select;
             public UnsafeList<RenderVertex> render;
             public int                      decisionStart, decisionCount;
+            // the input triangles its splits started from (WeldMemory)
+            public UnsafeList<int>          splitRoots;
             public readonly bool CollapseOnly => !indices.IsCreated;
         }
 
@@ -206,22 +214,29 @@ namespace Chisel.Core
                                            NativeList<float3x2> moves = default)
         {
             PlanWeldBeforeCollapse(brushes, ref state, out split, out paired, out cancelled, moves);
+            collapsed = Collapse(brushes, ref state, moves);
+        }
+
+        // The collapse, its steps one after another
+        static unsafe int Collapse(NativeList<BrushData> brushes, ref WeldState state, NativeList<float3x2> moves)
+        {
             var counts = state.edgeCounts.AsArray();
             for (int b = 0; b < brushes.Length; b++)
-                counts[b] = ShortEdgesOf(b, brushes.AsArray(), state.work, state.workIndex, null, null);
+                counts[b] = ShortEdgesOf(b, brushes.AsArray(), state.work, state.workIndex, state.scope, null, null);
             OffsetShortEdges(ref state);
             for (int b = 0; b < brushes.Length; b++)
-                ShortEdgesOf(b, brushes.AsArray(), state.work, state.workIndex,
+                ShortEdgesOf(b, brushes.AsArray(), state.work, state.workIndex, state.scope,
                              (float3x2*)state.shortPairs.GetUnsafePtr() + state.edgeOffsets[b].x, (float3*)state.keptCorners.GetUnsafePtr() + state.edgeOffsets[b].y);
-            collapsed = ClusterShortEdges(ref state, moves);
+            var collapsed = ClusterShortEdges(ref state, moves);
             var decisionCounts = state.decisionCounts.AsArray();
             for (int b = 0; b < brushes.Length; b++)
-                decisionCounts[b] = DecideCollapse(b, brushes.AsArray(), state.work, state.workIndex, state.movedTo, null);
+                decisionCounts[b] = DecideCollapse(b, brushes.AsArray(), state.work, state.workIndex, state.scope, state.movedTo, null);
             OffsetDecisions(ref state);
             for (int b = 0; b < brushes.Length; b++)
-                DecideCollapse(b, brushes.AsArray(), state.work, state.workIndex, state.movedTo,
+                DecideCollapse(b, brushes.AsArray(), state.work, state.workIndex, state.scope, state.movedTo,
                                (CollapseDecision*)state.decisions.GetUnsafePtr() + state.decisionOffsets[b]);
             ApplyCollapse(brushes, ref state);
+            return collapsed;
         }
 
         // The weld up to the collapse (the steps a job takes before ShortEdgesOf runs brush by brush)
@@ -245,7 +260,10 @@ namespace Chisel.Core
                 {
                     ref var list = ref surfaces[s].needles;
                     for (int n = 0; n < list.Length; n++)
-                        needles.Add(new Needle { brush = b, surface = s, triangle = list[n] });
+                    {
+                        if (state.scope.Contains(b, s, list[n]))
+                            needles.Add(new Needle { brush = b, surface = s, triangle = list[n] });
+                    }
                 }
             }
 
@@ -272,11 +290,11 @@ namespace Chisel.Core
             var work      = state.work;
             if (workIndex.Capacity < needles.Length * 2 + 16)
                 workIndex.Capacity = needles.Length * 2 + 16;
-            var opposites = new Opposites(TriangleCount(brushes), Allocator.Temp);
+            var opposites = new Opposites(state.scope.all.Value ? TriangleCount(brushes) : state.scope.inside.Length, Allocator.Temp);
             var fresh     = new NativeList<int3>(Allocator.Temp);
             try
             {
-                KeyAll(brushes, work, workIndex, ref opposites);
+                KeyAll(brushes, work, workIndex, state.scope, ref opposites);
                 for (bool changed = true, first = true; changed; first = false)
                 {
                     // after the first turn only the triangles the splits made can make a new pair
@@ -284,7 +302,7 @@ namespace Chisel.Core
                     KeyFresh(brushes, work, workIndex, fresh, ref opposites);
                     fresh.Clear();
                     changed  = CancelOpposites(brushes, work, workIndex, ref opposites, from, ref cancelled);
-                    changed |= WeldNeedles(brushes, bounds, needles, work, workIndex, fresh, ref split, ref paired);
+                    changed |= WeldNeedles(brushes, bounds, needles, work, workIndex, state.scope, fresh, ref split, ref paired);
                 }
             }
             finally
@@ -412,7 +430,7 @@ namespace Chisel.Core
 
         // One pass over the needles; true when it dropped one
         static bool WeldNeedles(NativeList<BrushData> brushes, NativeArray<MinMaxAABB> bounds, NativeList<Needle> needles,
-                                NativeList<Working> work, NativeParallelHashMap<long, int> workIndex, NativeList<int3> fresh,
+                                NativeList<Working> work, NativeParallelHashMap<long, int> workIndex, WeldScope scope, NativeList<int3> fresh,
                                 ref int split, ref int paired)
         {
             var changed = false;
@@ -433,7 +451,7 @@ namespace Chisel.Core
                 else continue;
 
                 // the triangle across it runs u -> w
-                if (!FindAcross(brushes, bounds, work, workIndex, needle, pu, pw,
+                if (!FindAcross(brushes, bounds, work, workIndex, scope, needle, pu, pw,
                                 out var acrossBrush, out var acrossSurface, out var acrossTriangle, out var au, out var aw, out var ad))
                     continue;
                 var pd = Position(brushes, work, workIndex, acrossBrush, acrossSurface, ad);
@@ -457,14 +475,14 @@ namespace Chisel.Core
             return changed;
         }
 
-        struct TriangleKey : System.IEquatable<TriangleKey>
+        internal struct TriangleKey : System.IEquatable<TriangleKey>
         {
             public int3 a, b, c;
             public bool Equals(TriangleKey other) => math.all(a == other.a) && math.all(b == other.b) && math.all(c == other.c);
             public override int GetHashCode() => (int)math.hash(new int3x3(a, b, c));
         }
 
-        static int3 Bits(float3 p)
+        internal static int3 Bits(float3 p)
         {
             var bits = math.asint(p);
             return math.select(bits, int3.zero, bits == new int3(int.MinValue));
@@ -534,11 +552,11 @@ namespace Chisel.Core
             return count;
         }
 
-        static void KeyAll(NativeList<BrushData> brushes, NativeList<Working> work, NativeParallelHashMap<long, int> workIndex, ref Opposites opposites)
+        static void KeyAll(NativeList<BrushData> brushes, NativeList<Working> work, NativeParallelHashMap<long, int> workIndex, WeldScope scope, ref Opposites opposites)
         {
             for (int b = 0; b < brushes.Length; b++)
             {
-                if (!brushes[b].brushRenderBuffer.IsCreated)
+                if (!brushes[b].brushRenderBuffer.IsCreated || !scope.Touches(b))
                     continue;
                 ref var surfaces = ref brushes[b].brushRenderBuffer.Value.surfaces;
                 for (int s = 0; s < surfaces.Length; s++)
@@ -551,7 +569,7 @@ namespace Chisel.Core
                         var copy = work[w];
                         for (int t = 0; t + 2 < copy.indices.Length; t += 3)
                         {
-                            if (copy.indices[t] < 0)
+                            if (copy.indices[t] < 0 || !scope.Contains(b, s, t / 3))
                                 continue;
                             opposites.Add(new int3(b, s, t / 3), copy.collider[copy.indices[t]], copy.collider[copy.indices[t + 1]], copy.collider[copy.indices[t + 2]]);
                         }
@@ -560,7 +578,10 @@ namespace Chisel.Core
                     ref var indices   = ref surfaces[s].indices;
                     ref var positions = ref surfaces[s].colliderVertices;
                     for (int t = 0; t + 2 < indices.Length; t += 3)
-                        opposites.Add(new int3(b, s, t / 3), positions[indices[t]], positions[indices[t + 1]], positions[indices[t + 2]]);
+                    {
+                        if (scope.Contains(b, s, t / 3))
+                            opposites.Add(new int3(b, s, t / 3), positions[indices[t]], positions[indices[t + 1]], positions[indices[t + 2]]);
+                    }
                 }
             }
         }
@@ -709,10 +730,10 @@ namespace Chisel.Core
         // A brush's short edges (pairs) and the corners that stay (kept: a needle's, and those of what the steps before
         // changed); counts them when pairs is null
         public static unsafe int2 ShortEdgesOf(int b, NativeArray<BrushData> brushes, NativeList<Working> work, NativeParallelHashMap<long, int> workIndex,
-                                               float3x2* pairs, float3* kept)
+                                               WeldScope scope, float3x2* pairs, float3* kept)
         {
             var count = int2.zero;
-            if (!brushes[b].brushRenderBuffer.IsCreated)
+            if (!brushes[b].brushRenderBuffer.IsCreated || !scope.Touches(b))
                 return count;
             var limitSq = kCollapseLength * kCollapseLength;
             var surfaceCount = brushes[b].brushRenderBuffer.Value.surfaces.Length;
@@ -724,7 +745,7 @@ namespace Chisel.Core
                 var view = new SurfaceView(brushes, work, workIndex, b, s);
                 for (int t = 0; t < view.TriangleCount; t++)
                 {
-                    if (!view.Corners(t, out var c0, out var c1, out var c2))
+                    if (!view.Corners(t, out var c0, out var c1, out var c2) || !scope.Contains(b, s, t))
                         continue;
                     var q0 = view.Position(c0) + 0.0f;
                     var q1 = view.Position(c1) + 0.0f;
@@ -823,10 +844,11 @@ namespace Chisel.Core
         // collapse leaves without area is dropped, judged from the corners as they were (one the collapse did not touch stays
         // as it is), and every corner of a triangle left at a position that moves takes its cluster's
         public static unsafe int DecideCollapse(int b, NativeArray<BrushData> brushes, NativeList<Working> work, NativeParallelHashMap<long, int> workIndex,
-                                                NativeParallelHashMap<float3, float3> movedTo, CollapseDecision* decisions)
+                                                WeldScope scope, NativeParallelHashMap<float3, float3> movedTo, CollapseDecision* decisions)
         {
             var count = 0;
-            if (!brushes[b].brushRenderBuffer.IsCreated || movedTo.Count() == 0)
+            // a triangle out of the scope has no corner at a position that moves
+            if (!brushes[b].brushRenderBuffer.IsCreated || !scope.Touches(b) || movedTo.Count() == 0)
                 return 0;
             var targets = new NativeList<float3>(64, Allocator.Temp);
             var movedAt = new NativeList<bool>(64, Allocator.Temp);
@@ -1092,12 +1114,12 @@ namespace Chisel.Core
 
         // The first triangle, in brush, surface and triangle order, that runs u -> w; its corners at u and w and the third, d
         static bool FindAcross(NativeList<BrushData> brushes, NativeArray<MinMaxAABB> bounds, NativeList<Working> work,
-                               NativeParallelHashMap<long, int> workIndex, Needle needle, float3 pu, float3 pw,
+                               NativeParallelHashMap<long, int> workIndex, WeldScope scope, Needle needle, float3 pu, float3 pw,
                                out int acrossBrush, out int acrossSurface, out int acrossTriangle, out int au, out int aw, out int ad)
         {
             for (int b = 0; b < brushes.Length; b++)
             {
-                if (!Contains(bounds[b], pu) || !Contains(bounds[b], pw))
+                if (!scope.Touches(b) || !Contains(bounds[b], pu) || !Contains(bounds[b], pw))
                     continue;
                 ref var surfaces = ref brushes[b].brushRenderBuffer.Value.surfaces;
                 for (int s = 0; s < surfaces.Length; s++)
@@ -1107,7 +1129,7 @@ namespace Chisel.Core
                     var count = TriangleCount(brushes, work, workIndex, b, s);
                     for (int t = 0; t < count; t++)
                     {
-                        if (b == needle.brush && s == needle.surface && t == needle.triangle)
+                        if ((b == needle.brush && s == needle.surface && t == needle.triangle) || !scope.Contains(b, s, t))
                             continue;
                         if (!Corners(brushes, work, workIndex, b, s, t, out var c0, out var c1, out var c2))
                             continue;
@@ -1171,6 +1193,12 @@ namespace Chisel.Core
         {
             var c = WorkOn(brushes, work, workIndex, brush, surface);
             ref var copy = ref work.ElementAt(c);
+            if (triangle < brushes[brush].brushRenderBuffer.Value.surfaces[surface].indices.Length / 3)
+            {
+                if (!copy.splitRoots.IsCreated)
+                    copy.splitRoots = new UnsafeList<int>(1, Allocator.Persistent);
+                copy.splitRoots.Add(triangle);
+            }
             var pu = copy.collider[u];
             var pw = copy.collider[w];
             var along = pw - pu;

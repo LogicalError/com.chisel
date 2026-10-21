@@ -97,11 +97,15 @@ namespace Chisel.Core
         [NoAlias, ReadOnly] public int meshQueryLength;
         [NoAlias, ReadOnly] public NativeList<IndexOrder>                                  allTreeBrushIndexOrders;
         [NoAlias, ReadOnly] public NativeList<BlobAssetReference<ChiselBrushRenderBuffer>> brushRenderBufferCache;
+        // the brushes whose buffers this update made again
+        [NoAlias, ReadOnly] public NativeList<IndexOrder>                                  allUpdateBrushIndexOrders;
 
         // Write
         [NoAlias] public NativeList<BrushData> brushRenderData;
 
         [NoAlias] public NativeReference<int> surfaceCountRef;
+        // what the weld did at the last update, kept with the tree
+        [NoAlias] public WeldMemory weldMemory;
         // where the weld's last step moved the corners it moved (OutputModelWeld.WeldModel), kept with the tree
         [NoAlias] public NativeList<float3x2> collapseMoves;
         // the surfaces the weld changed and the brushes to store again (CopyWeldedBrushesJob)
@@ -139,7 +143,10 @@ namespace Chisel.Core
             // The weld at the very end across the whole model: needles that close a seam go with the triangle across them
             // (its collapse runs brush by brush in the jobs after this one; the brushes it changed are stored again by
             // CopyWeldedBrushesJob)
-            OutputModelWeld.PlanWeldBeforeCollapse(brushRenderData, ref weld, out _, out _, out _, collapseMoves);
+            OutputModelWeld.PrepareIncremental(brushRenderData, allUpdateBrushIndexOrders.AsArray(), ref weldMemory, ref weld);
+            do
+                OutputModelWeld.PlanWeldBeforeCollapse(brushRenderData, ref weld, out _, out _, out _, collapseMoves);
+            while (OutputModelWeld.TakeInSplitSurfaces(brushRenderData, ref weldMemory, ref weld));
         }
     }
 
@@ -153,6 +160,7 @@ namespace Chisel.Core
         [NoAlias, ReadOnly] public NativeList<OutputModelWeld.Working> work;
         [NoAlias, ReadOnly] public NativeParallelHashMap<long, int>    workIndex;
         [NoAlias, ReadOnly] public NativeArray<int2>                   edgeOffsets;
+        [NoAlias, ReadOnly] public WeldScope                           scope;
 
         [NativeDisableParallelForRestriction] [NoAlias] public NativeArray<int2>     edgeCounts;
         [NativeDisableParallelForRestriction] [NoAlias] public NativeArray<float3x2> shortPairs;
@@ -162,16 +170,16 @@ namespace Chisel.Core
         {
             if (!write)
             {
-                edgeCounts[b] = OutputModelWeld.ShortEdgesOf(b, brushRenderData, work, workIndex, null, null);
+                edgeCounts[b] = OutputModelWeld.ShortEdgesOf(b, brushRenderData, work, workIndex, scope, null, null);
                 return;
             }
-            OutputModelWeld.ShortEdgesOf(b, brushRenderData, work, workIndex,
+            OutputModelWeld.ShortEdgesOf(b, brushRenderData, work, workIndex, scope,
                                          (float3x2*)shortPairs.GetUnsafePtr() + edgeOffsets[b].x, (float3*)keptCorners.GetUnsafePtr() + edgeOffsets[b].y);
         }
     }
 
     // The collapse's steps that see the whole model: 0 where each brush's short edges go, 1 the clusters, 2 where each
-    // brush's decisions go, 3 the decisions carried out
+    // brush's decisions go, 3 the decisions carried out, and what the weld did kept (OutputModelWeld.RecordIncremental)
     [BurstCompile(CompileSynchronously = true)]
     struct CollapseStepJob : IJob
     {
@@ -179,6 +187,7 @@ namespace Chisel.Core
         [NoAlias] public NativeList<BrushData>  brushRenderData;
         [NoAlias] public NativeList<float3x2>   collapseMoves;
         [NoAlias] public WeldState              weld;
+        [NoAlias] public WeldMemory             weldMemory;
 
         public void Execute()
         {
@@ -187,7 +196,10 @@ namespace Chisel.Core
                 case 0: OutputModelWeld.OffsetShortEdges(ref weld); break;
                 case 1: OutputModelWeld.ClusterShortEdges(ref weld, collapseMoves); break;
                 case 2: OutputModelWeld.OffsetDecisions(ref weld); break;
-                case 3: OutputModelWeld.ApplyCollapse(brushRenderData, ref weld); break;
+                case 3:
+                    OutputModelWeld.ApplyCollapse(brushRenderData, ref weld);
+                    OutputModelWeld.RecordIncremental(brushRenderData, ref weldMemory, ref weld, collapseMoves);
+                    break;
             }
         }
     }
@@ -202,6 +214,7 @@ namespace Chisel.Core
         [NoAlias, ReadOnly] public NativeParallelHashMap<long, int>       workIndex;
         [NoAlias, ReadOnly] public NativeParallelHashMap<float3, float3>  movedTo;
         [NoAlias, ReadOnly] public NativeArray<int>                       decisionOffsets;
+        [NoAlias, ReadOnly] public WeldScope                              scope;
 
         [NativeDisableParallelForRestriction] [NoAlias] public NativeArray<int>                              decisionCounts;
         [NativeDisableParallelForRestriction] [NoAlias] public NativeArray<OutputModelWeld.CollapseDecision> decisions;
@@ -210,10 +223,10 @@ namespace Chisel.Core
         {
             if (!write)
             {
-                decisionCounts[b] = OutputModelWeld.DecideCollapse(b, brushRenderData, work, workIndex, movedTo, null);
+                decisionCounts[b] = OutputModelWeld.DecideCollapse(b, brushRenderData, work, workIndex, scope, movedTo, null);
                 return;
             }
-            OutputModelWeld.DecideCollapse(b, brushRenderData, work, workIndex, movedTo,
+            OutputModelWeld.DecideCollapse(b, brushRenderData, work, workIndex, scope, movedTo,
                                            (OutputModelWeld.CollapseDecision*)decisions.GetUnsafePtr() + decisionOffsets[b]);
         }
     }
@@ -330,14 +343,13 @@ namespace Chisel.Core
         [NoAlias, ReadOnly] public NativeArray<BrushData>              brushRenderData;
         [NoAlias, ReadOnly] public NativeList<OutputModelWeld.Working> work;
         [NoAlias, ReadOnly] public NativeParallelHashMap<long, int>    workIndex;
-        [NoAlias, ReadOnly] public NativeParallelHashMap<CompactNodeID, WeldCopyEntry> weldCopyCache;
         [NoAlias, ReadOnly] public NativeList<OutputModelWeld.CollapseDecision> collapseDecisions;
 
         [NoAlias] public NativeArray<WeldCopy> copies;
 
         public void Execute(int index)
         {
-            copies[index] = OutputModelWeld.CopyPlanned(copies[index], brushRenderData, work, workIndex, collapseDecisions, weldCopyCache);
+            copies[index] = OutputModelWeld.CopyPlanned(copies[index], brushRenderData, work, workIndex, collapseDecisions, default);
         }
     }
 
@@ -385,7 +397,9 @@ namespace Chisel.Core
         [NoAlias] public NativeList<BlobAssetReference<ChiselBrushRenderBuffer>> patchedRenderBuffers;
         [NoAlias] public HotspotCutState hotspotCut;
         [NoAlias] public FindState       hotspotFind;
-        [NoAlias] public NativeParallelHashMap<CompactNodeID, WeldCopyEntry> weldCopyCache;
+        [NoAlias] public WeldMemory      weldMemory;
+        [NoAlias, ReadOnly] public NativeList<float3x2> collapseMoves;
+        public bool verify, report;
 
         public void Execute()
         {
@@ -393,7 +407,7 @@ namespace Chisel.Core
             hotspotCut.kept.Clear();
             for (int i = 0; i < brushRenderData.Length; i++)
                 hotspotCut.kept.Add(brushRenderData[i].brushRenderBuffer);
-            OutputModelWeld.FinishWeld(brushRenderData, patchedRenderBuffers, weldCopies, weldCopyCache);
+            OutputModelWeld.FinishIncremental(brushRenderData, weldCopies, ref weldMemory, verify, report, collapseMoves);
             HotspotGroups.StartKinds(brushRenderData, ref hotspotFind);
         }
     }

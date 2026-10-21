@@ -51,7 +51,8 @@ namespace Chisel.Core
             public NativeList<float3x2>                                         collapseMoves;
             // What the hotspot cut made of each brush's surfaces, kept while its inputs stay the same (OutputHotspotSections.CutModel)
             public NativeParallelHashMap<CompactNodeID, HotspotCutEntry>        hotspotCutCache;
-            public NativeParallelHashMap<CompactNodeID, WeldCopyEntry>          weldCopyCache;
+            // what the weld did at the last update (OutputModelWeld.PrepareIncremental)
+            public WeldMemory                                                   weldMemory;
             // what the last update's hotspot grouping found (HotspotGroups.PrepareIncremental)
             public HotspotGroupMemory                                          hotspotGroupMemory;
             // What each group of hotspot surfaces was matched with, by what it was made from (HotspotGroups.Match)
@@ -84,7 +85,7 @@ namespace Chisel.Core
 				hotspotLayoutHashes         = new NativeList<uint>(4, Allocator.Persistent);
 				collapseMoves               = new NativeList<float3x2>(4, Allocator.Persistent);
 				hotspotCutCache             = new NativeParallelHashMap<CompactNodeID, HotspotCutEntry>(16, Allocator.Persistent);
-				weldCopyCache               = new NativeParallelHashMap<CompactNodeID, WeldCopyEntry>(16, Allocator.Persistent);
+				weldMemory                  = WeldMemory.Create(Allocator.Persistent);
 				hotspotGroupMemory          = HotspotGroupMemory.Create(Allocator.Persistent);
 				hotspotMatchCache           = new NativeParallelHashMap<uint4, GroupMatchEntry>(16, Allocator.Persistent);
 				renderMeshHashes            = new NativeParallelHashMap<RenderMeshKey, uint4>(16, Allocator.Persistent);
@@ -276,16 +277,8 @@ namespace Chisel.Core
                     hotspotCutCache.Dispose();
                 }
                 hotspotCutCache = default;
-                if (weldCopyCache.IsCreated)
-                {
-                    foreach (var entry in weldCopyCache)
-                    {
-                        if (entry.Value.result.IsCreated)
-                            entry.Value.result.Dispose();
-                    }
-                    weldCopyCache.Dispose();
-                }
-                weldCopyCache = default;
+                weldMemory.Dispose();
+                weldMemory = default;
                 hotspotGroupMemory.Dispose();
                 hotspotGroupMemory = default;
                 if (hotspotMatchCache.IsCreated)

@@ -53,6 +53,8 @@ namespace Chisel.Core
             public NativeParallelHashMap<CompactNodeID, HotspotCutEntry>        hotspotCutCache;
             // what the weld did at the last update (OutputModelWeld.PrepareIncremental)
             public WeldMemory                                                   weldMemory;
+            // what the hotspot stage found for each brush (HotspotStageMemory.Prepare)
+            public HotspotStageMemory                                           hotspotStageMemory;
             // what the last update's hotspot grouping found (HotspotGroups.PrepareIncremental)
             public HotspotGroupMemory                                          hotspotGroupMemory;
             // What each group of hotspot surfaces was matched with, by what it was made from (HotspotGroups.Match)
@@ -86,6 +88,7 @@ namespace Chisel.Core
 				collapseMoves               = new NativeList<float3x2>(4, Allocator.Persistent);
 				hotspotCutCache             = new NativeParallelHashMap<CompactNodeID, HotspotCutEntry>(16, Allocator.Persistent);
 				weldMemory                  = WeldMemory.Create(Allocator.Persistent);
+				hotspotStageMemory          = HotspotStageMemory.Create(Allocator.Persistent);
 				hotspotGroupMemory          = HotspotGroupMemory.Create(Allocator.Persistent);
 				hotspotMatchCache           = new NativeParallelHashMap<uint4, GroupMatchEntry>(16, Allocator.Persistent);
 				renderMeshHashes            = new NativeParallelHashMap<RenderMeshKey, uint4>(16, Allocator.Persistent);
@@ -279,6 +282,8 @@ namespace Chisel.Core
                 hotspotCutCache = default;
                 weldMemory.Dispose();
                 weldMemory = default;
+                hotspotStageMemory.Dispose();
+                hotspotStageMemory = default;
                 hotspotGroupMemory.Dispose();
                 hotspotGroupMemory = default;
                 if (hotspotMatchCache.IsCreated)

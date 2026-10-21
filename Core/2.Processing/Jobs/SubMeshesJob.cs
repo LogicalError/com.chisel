@@ -400,6 +400,8 @@ namespace Chisel.Core
         [NoAlias] public WeldMemory      weldMemory;
         [NoAlias, ReadOnly] public NativeList<float3x2> collapseMoves;
         public bool verify, report;
+        [NoAlias, ReadOnly] public NativeArray<HotspotLayoutData> hotspotLayouts;
+        [NoAlias] public HotspotStageMemory hotspotStageMemory;
 
         public void Execute()
         {
@@ -409,6 +411,7 @@ namespace Chisel.Core
                 hotspotCut.kept.Add(brushRenderData[i].brushRenderBuffer);
             OutputModelWeld.FinishIncremental(brushRenderData, weldCopies, ref weldMemory, verify, report, collapseMoves);
             HotspotGroups.StartKinds(brushRenderData, ref hotspotFind);
+            hotspotStageMemory.Prepare(brushRenderData, hotspotLayouts, weldMemory.sameBuffer);
         }
     }
 
@@ -421,10 +424,36 @@ namespace Chisel.Core
         [NoAlias, ReadOnly] public NativeArray<int>               kindStart;
         [NativeDisableParallelForRestriction] [NoAlias] public NativeArray<byte>  kinds;
         [NativeDisableParallelForRestriction] [NoAlias] public NativeArray<uint4> hashes;
+        // what was kept of each brush (HotspotStageMemory): its slot, whether its kinds are kept, the slots
+        [NoAlias, ReadOnly] public NativeArray<int>  slotOfBrush;
+        [NoAlias, ReadOnly] public NativeArray<bool> keptKinds;
+        [NoAlias, ReadOnly] public NativeArray<HotspotStageBrush> stageBrushes;
+        public bool verify;
 
         public void Execute(int b)
         {
+            if (!brushRenderData[b].brushRenderBuffer.IsCreated)
+                return;
+            var kept  = stageBrushes[slotOfBrush[b]];
+            var start = kindStart[b];
+            var count = kindStart[b + 1] - start;
+            if (keptKinds[b])
+            {
+                for (int s = 0; s < count; s++)
+                {
+                    kinds[start + s]  = kept.kinds[s];
+                    hashes[start + s] = kept.hashes[s];
+                }
+                if (verify)
+                    HotspotGroups.VerifyKeptKinds(b, brushRenderData, hotspotLayouts, kindStart, kinds, hashes);
+                return;
+            }
             HotspotGroups.KindsOf(b, brushRenderData, hotspotLayouts, kindStart, kinds, hashes);
+            for (int s = 0; s < count; s++)
+            {
+                kept.kinds[s]  = kinds[start + s];
+                kept.hashes[s] = hashes[start + s];
+            }
         }
     }
 
@@ -499,11 +528,28 @@ namespace Chisel.Core
 
         [NativeDisableParallelForRestriction] [NoAlias] public NativeArray<uint4> brushKeys;
         [NativeDisableParallelForRestriction] [NoAlias] public NativeArray<byte>  brushCuts;
+        // each brush's content hash, kept while its buffer stays (HotspotStageMemory)
+        [NoAlias, ReadOnly] public NativeArray<int>  slotOfBrush;
+        [NoAlias, ReadOnly] public NativeArray<bool> keptContent;
+        [NativeDisableParallelForRestriction] [NoAlias] public NativeArray<HotspotStageBrush> stageBrushes;
+        public bool verify;
 
         public void Execute(int b)
         {
-            brushCuts[b] = OutputHotspotSections.BrushCutKey(b, brushRenderData, groupOf.Value, unfoldOf.Value, bordersOf, groupKeys, globalKey.Value, cached, out var key);
+            var slot    = slotOfBrush[b];
+            var kept    = stageBrushes[slot];
+            var content = kept.content;
+            brushCuts[b] = OutputHotspotSections.BrushCutKey(b, brushRenderData, groupOf.Value, unfoldOf.Value, bordersOf, groupKeys, globalKey.Value, cached,
+                                                             keptContent[b], ref content, out var key, out var made);
             brushKeys[b] = key;
+            if (made)
+            {
+                kept.content    = content;
+                kept.hasContent = true;
+                stageBrushes[slot] = kept;
+            } else
+            if (verify && keptContent[b])
+                OutputHotspotSections.VerifyKeptContent(b, brushRenderData, content);
         }
     }
 

@@ -409,6 +409,23 @@ namespace Chisel.Core
             }
         }
 
+        // VerifyIncremental: a brush's kept kinds and hashes are what KindsOf makes of it now
+        public static void VerifyKeptKinds(int b, NativeArray<BrushData> brushes, NativeArray<HotspotLayoutData> layouts, NativeArray<int> kindStart, NativeArray<byte> kinds,
+                                           NativeArray<uint4> hashes)
+        {
+            ref var surfaces = ref brushes[b].brushRenderBuffer.Value.surfaces;
+            for (int s = 0; s < surfaces.Length; s++)
+            {
+                var kind = KindOf(ref surfaces[s], layouts);
+                var hash = kind == 0 ? default : SurfaceHash(ref surfaces[s], kind);
+                if (kinds[kindStart[b] + s] != kind || !hashes[kindStart[b] + s].Equals(hash))
+                {
+                    UnityEngine.Debug.LogError($"Kept hotspot kind of brush {b}, surface {s} differs from what its buffer gives now");
+                    return;
+                }
+            }
+        }
+
         // What grouping reads of a candidate that is its own: its kind, its frame and settings, its corners
         public static unsafe uint4 SurfaceHash(ref ChiselSurfaceRenderBuffer surface, byte kind)
         {

@@ -139,6 +139,8 @@ namespace Chisel.Core
         // this update's: the scope, its slot of each brush
         public NativeParallelHashSet<WeldTriangle> scope;
         public NativeList<int> slotOfBrush;
+        // brush by brush: its buffer is the one it was handed at the last update (FinishIncremental)
+        public NativeList<bool> sameBuffer;
 
         public static WeldMemory Create(Allocator allocator)
         {
@@ -155,7 +157,8 @@ namespace Chisel.Core
                 valid       = new NativeReference<bool>(allocator),
                 lastScope   = new NativeReference<int>(allocator),
                 scope       = new NativeParallelHashSet<WeldTriangle>(256, allocator),
-                slotOfBrush = new NativeList<int>(64, allocator)
+                slotOfBrush = new NativeList<int>(64, allocator),
+                sameBuffer  = new NativeList<bool>(64, allocator)
             };
         }
 
@@ -193,6 +196,7 @@ namespace Chisel.Core
             if (lastScope.IsCreated)   lastScope.Dispose();
             if (scope.IsCreated)       scope.Dispose();
             if (slotOfBrush.IsCreated) slotOfBrush.Dispose();
+            if (sameBuffer.IsCreated)  sameBuffer.Dispose();
         }
     }
 
@@ -816,6 +820,13 @@ namespace Chisel.Core
                 WeldModel(reference, referencePatched, out _, out _, out _, out _, referenceMoves);
             }
 
+            // neither its input nor what the weld made of it changed
+            memory.sameBuffer.ResizeUninitialized(brushes.Length);
+            for (int b = 0; b < brushes.Length; b++)
+            {
+                ref var brush = ref memory.brushes.ElementAt(memory.slotOfBrush[b]);
+                memory.sameBuffer[b] = !brush.changed && !brush.dirty;
+            }
             for (int i = 0; i < copies.Length; i++)
             {
                 ref var brush = ref memory.brushes.ElementAt(memory.slotOfBrush[copies[i].brush]);

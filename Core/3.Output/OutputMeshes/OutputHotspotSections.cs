@@ -173,8 +173,9 @@ namespace Chisel.Core
             var cuts = state.brushCuts.AsArray();
             for (int b = 0; b < brushes.Length; b++)
             {
+                var content = default(uint4);
                 cuts[b] = BrushCutKey(b, brushes.AsArray(), state.GroupOf, state.UnfoldOf, state.bordersOf, state.groupKeys.AsArray(), state.globalKey.Value,
-                                      cache.IsCreated, out var key);
+                                      cache.IsCreated, false, ref content, out var key, out _);
                 keys[b] = key;
             }
             FinishCutKeys(brushes, cache, ref state);
@@ -215,20 +216,62 @@ namespace Chisel.Core
 
         // Whether a brush is cut (0 not, 1 keyed, 2 every time) and its key: what the cut reads, the brush as the weld left
         // it, its groups, the borders given by hand, the layouts. Each brush is independent of the others.
+        // content: the brush's ContentHash, given (contentKept) or made here (made)
         public static byte BrushCutKey(int b, NativeArray<BrushData> brushes, UnsafeHashMap<int2, int> groupOf, UnsafeHashMap<int2, float4x4> unfoldOf,
                                        in UnsafeParallelMultiHashMap<int2, HotspotBorderCorner> bordersOf, NativeArray<uint4> groupKeys, uint4 globalKey,
-                                       bool cached, out uint4 key)
+                                       bool cached, bool contentKept, ref uint4 content, out uint4 key, out bool made)
         {
             key = default;
+            made = false;
             if (!brushes[b].brushRenderBuffer.IsCreated ||
                 (!HasSections(ref brushes[b].brushRenderBuffer.Value) && !InGroup(ref brushes[b].brushRenderBuffer.Value, b, groupOf)))
                 return 0;
             if (!cached)
                 return 2;
+            if (!contentKept)
+            {
+                if (!ContentHash(brushes[b].brushRenderBuffer, out content))
+                    return 2;
+                made = true;
+            }
             var rules = new NativeList<HotspotBorderCorner>(4, Allocator.Temp);
-            var keyed = BrushKey(brushes[b].brushRenderBuffer, b, groupOf, unfoldOf, bordersOf, groupKeys, globalKey, rules, out key);
+            BrushKey(brushes[b].brushRenderBuffer, b, content, groupOf, unfoldOf, bordersOf, groupKeys, globalKey, rules, out key);
             rules.Dispose();
-            return (byte)(keyed ? 1 : 2);
+            return 1;
+        }
+
+        // A brush's buffer, hashed without what the cut writes into it in place (each surface's group and its variations,
+        // StartCutKeys): the same while the buffer is; false when it cannot be hashed
+        public static unsafe bool ContentHash(BlobAssetReference<ChiselBrushRenderBuffer> source, out uint4 hash)
+        {
+            hash = default;
+            if (!BlobBytes(source, out var data, out var length))
+                return false;
+            var state = new xxHash3.StreamingState(false);
+            var zero  = 0;
+            long at = 0;
+            ref var surfaces = ref source.Value.surfaces;
+            for (int s = 0; s < surfaces.Length; s++)
+            {
+                var group      = (byte*)UnsafeUtility.AddressOf(ref surfaces[s].hotspot.group) - data;
+                var variations = (byte*)UnsafeUtility.AddressOf(ref surfaces[s].hotspot.groupVariations) - data;
+                state.Update(data + at, (int)(group - at));
+                state.Update(&zero, sizeof(int));
+                at = group + sizeof(int);
+                state.Update(data + at, (int)(variations - at));
+                state.Update(&zero, sizeof(int));
+                at = variations + sizeof(int);
+            }
+            state.Update(data + at, (int)(length - at));
+            hash = state.DigestHash128();
+            return true;
+        }
+
+        // HotspotGroups.VerifyIncremental: a kept content hash is the one the buffer has now
+        public static void VerifyKeptContent(int b, NativeArray<BrushData> brushes, uint4 content)
+        {
+            if (!ContentHash(brushes[b].brushRenderBuffer, out var now) || !now.Equals(content))
+                UnityEngine.Debug.LogError($"Kept hotspot content hash of brush {b} differs from its buffer's");
         }
 
         // The brushes to cut (work): a brush whose key is what it was when the cache kept its cut is given that cut here
@@ -381,21 +424,20 @@ namespace Chisel.Core
         }
 
         // One key for everything Cut reads for the brush; false when the brush cannot be keyed (it is cut every time then)
-        static unsafe bool BrushKey(BlobAssetReference<ChiselBrushRenderBuffer> source, int brush, UnsafeHashMap<int2, int> groupOf, UnsafeHashMap<int2, float4x4> unfoldOf,
+        static unsafe void BrushKey(BlobAssetReference<ChiselBrushRenderBuffer> source, int brush, uint4 content, UnsafeHashMap<int2, int> groupOf, UnsafeHashMap<int2, float4x4> unfoldOf,
                                     in UnsafeParallelMultiHashMap<int2, HotspotBorderCorner> bordersOf, NativeArray<uint4> groupKeys, uint4 globalKey,
                                     NativeList<HotspotBorderCorner> rules, out uint4 key)
         {
-            key = default;
-            if (!BlobBytes(source, out var data, out var length))
-                return false;
             var buffer = new UnsafeAppendBuffer(256, 16, Allocator.Temp);
             try
             {
-                buffer.Add(Hash(data, length));
+                buffer.Add(content);
                 buffer.Add(globalKey);
                 ref var surfaces = ref source.Value.surfaces;
                 for (int s = 0; s < surfaces.Length; s++)
                 {
+                    buffer.Add(surfaces[s].hotspot.group);
+                    buffer.Add(surfaces[s].hotspot.groupVariations);
                     if (surfaces[s].indices.Length > 0 && groupOf.TryGetValue(new int2(brush, s), out var g))
                     {
                         buffer.Add(1);
@@ -412,7 +454,6 @@ namespace Chisel.Core
                         buffer.Add(rules[r]);
                 }
                 key = xxHash3.Hash128(buffer.Ptr, buffer.Length);
-                return true;
             }
             finally
             {

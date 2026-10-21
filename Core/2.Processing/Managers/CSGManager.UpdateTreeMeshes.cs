@@ -66,6 +66,21 @@ namespace Chisel.Core
         // (modified + touching) and how many the propagation dirtied for the next round.
         public static string LastUpdateLog             { get; private set; } = "";
 
+        // The debug visualization meshes an update makes (bit i: AssignMeshesJob.kGeneratedDebugRendererFlags[i]); one
+        // added makes every tree's meshes again at the next update, without building any brush again
+        public static int DebugVisualizations
+        {
+            get => s_DebugVisualizations;
+            set
+            {
+                if ((value & ~s_DebugVisualizations) != 0)
+                    s_RemakeMeshes = true;
+                s_DebugVisualizations = value;
+            }
+        }
+        static int  s_DebugVisualizations;
+        static bool s_RemakeMeshes;
+
         #region Update / Rebuild
 
         static readonly ProfilerMarker kUpdateTreeMeshesProfilerMarker = new("UpdateTreeMeshes");
@@ -86,11 +101,13 @@ namespace Chisel.Core
 			CompactHierarchyManager.GetAllTrees(instance.allTrees);
             // Check if we have a tree that needs updates
             instance.updatedTrees.Clear();
+            TreeUpdate.s_RemakeAll = s_RemakeMeshes;
+            s_RemakeMeshes = false;
             for (int t = 0; t < instance.allTrees.Length; t++)
             {
                 var tree = instance.allTrees[t];
                 if (tree.Valid &&
-                    tree.IsStatusFlagSet(NodeStatusFlags.TreeNeedsUpdate))
+                    (TreeUpdate.s_RemakeAll || tree.IsStatusFlagSet(NodeStatusFlags.TreeNeedsUpdate)))
                 {
                     instance.updatedTrees.Add(tree);
                     needUpdate = true;
@@ -109,6 +126,7 @@ namespace Chisel.Core
                 TreeUpdate.s_Log.Clear();
                 System.Array.Clear(TreeUpdate.s_LastExactCSGStats, 0, TreeUpdate.s_LastExactCSGStats.Length);
 				allTrees = TreeUpdate.ScheduleTreeMeshJobs(finishMeshUpdates, instance.updatedTrees, canSkipTreeUpdate);
+                TreeUpdate.s_RemakeAll = false;
 
                 // Further rounds for the brushes the welding/T-junction propagation dirtied (see
                 // kMaxPropagationRounds), until nothing moves any more.
@@ -171,6 +189,8 @@ namespace Chisel.Core
             // Propagation-round bookkeeping shared between UpdateAllTreeMeshes (which loops) and
             // ScheduleTreeMeshJobs (which dirties the stale brushes); see kMaxPropagationRounds.
             internal static int  s_PropagationRound;
+            // this round makes every tree's meshes again (DebugVisualizations)
+            internal static bool s_RemakeAll;
             internal static bool s_PropagationRequested;
             internal static int  s_ModifiedBrushCount;
             internal static int  s_StaleBrushCount;
@@ -795,12 +815,12 @@ namespace Chisel.Core
                             if (!compactHierarchy.IsValidCompactNodeID(treeCompactNodeID))
                                 continue;
 
-                            if (!compactHierarchy.IsNodeDirty(treeCompactNodeID))
+                            if (!compactHierarchy.IsNodeDirty(treeCompactNodeID) && !s_RemakeAll)
                                 continue;
 
                             // Asked after the generators ran, so every brush has its mesh. A tree whose output is still
                             // what its input builds isn't built (see Flush(FinishMeshUpdate, CanSkipTreeUpdate)).
-                            if (canSkipTreeUpdate != null && canSkipTreeUpdate(tree))
+                            if (!s_RemakeAll && canSkipTreeUpdate != null && canSkipTreeUpdate(tree))
                             {
                                 SkipTreeUpdate(tree, treeCompactNodeID);
                                 continue;
@@ -884,7 +904,8 @@ namespace Chisel.Core
                                     treeUpdate.brushListChanged = treeUpdate.brushCount > 0 && treeUpdate.Temporaries.needRemappingRef.Value;
 
                                     if (treeUpdate.updateCount <= 0 &&
-                                        !treeUpdate.brushListChanged)
+                                        !treeUpdate.brushListChanged &&
+                                        !(s_RemakeAll && treeUpdate.brushCount > 0))
                                         continue;
 
                                     treeUpdate.JobHandles.SeedResourceWriter(JobHandleType.compactHierarchyJobHandle, sharedCompactHierarchy);
@@ -954,7 +975,8 @@ namespace Chisel.Core
 
                             if (treeUpdate.updateCount <= 0 &&
                                 !treeUpdate.brushListChanged &&
-                                treeUpdate.brushCount > 0)
+                                treeUpdate.brushCount > 0 &&
+                                !s_RemakeAll)
                                 continue;
 
                             //
@@ -2827,7 +2849,15 @@ namespace Chisel.Core
                     JobHandles[JobHandleType.subMeshSurfacesJobHandle].writeBarrier.Complete();
                     // a render mesh made from the same as last time is kept as it is
                     var keptCount = FindKeptSections(chiselLookupValues.renderMeshHashes);
-                    var meshAllocations = Temporaries.vertexBufferContents.subMeshSections.Length - keptCount;
+                    // and a debug visualization no draw mode shows is not made
+                    var hiddenCount = 0;
+                    var sections = Temporaries.vertexBufferContents.subMeshSections;
+                    for (int i = 0; i < sections.Length; i++)
+                    {
+                        if (AssignMeshesJob.HiddenDebugVisualization(sections[i].meshQuery, DebugVisualizations))
+                            hiddenCount++;
+                    }
+                    var meshAllocations = sections.Length - keptCount - hiddenCount;
 
                     Temporaries.meshDataArray = UnityEngine.Mesh.AllocateWritableMeshData(meshAllocations);
 
@@ -2845,6 +2875,7 @@ namespace Chisel.Core
                         subMeshSections  = Temporaries.vertexBufferContents.subMeshSections,
                         meshDatas        = Temporaries.meshDatas,
                         keptSections     = Temporaries.keptSections,
+                        debugVisualizations = DebugVisualizations,
                         sectionLightmapHashes = Temporaries.sectionLightmapHashes,
 
                         // Write

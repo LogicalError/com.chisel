@@ -29,6 +29,7 @@ namespace Chisel.Components
 		static void ResetState()
 		{
 			s_CameraDrawMode.Clear();
+			UpdateDebugVisualizations();
 			s_IgnoreVisibility = false;
 			s_UpdateVisibilityFlag = true; 
             s_BrushVisibilityLookup.Clear();
@@ -101,11 +102,31 @@ namespace Chisel.Components
 		public static void ResetCameraDrawMode(Camera camera)
         {
             s_CameraDrawMode.Remove(camera);
+            UpdateDebugVisualizations();
         }
 
         public static void SetCameraDrawMode(Camera camera, DrawModeFlags drawModeFlags)
         {
             s_CameraDrawMode[camera] = drawModeFlags;
+            UpdateDebugVisualizations();
+        }
+
+        // Only the debug visualization meshes some camera's draw mode shows are made
+        static void UpdateDebugVisualizations()
+        {
+            var shown = DrawModeFlags.None;
+            foreach (var pair in s_CameraDrawMode)
+            {
+                if (pair.Key)
+                    shown |= pair.Value;
+            }
+            var debugVisualizations = 0;
+            for (int i = 0; i < ChiselGeneratedObjects.kGeneratedVisualizationShowFlags.Length; i++)
+            {
+                if ((shown & ChiselGeneratedObjects.kGeneratedVisualizationShowFlags[i]) != DrawModeFlags.None)
+                    debugVisualizations |= 1 << i;
+            }
+            CompactHierarchyManager.DebugVisualizations = debugVisualizations;
         }
 
         public static DrawModeFlags GetCameraDrawMode(Camera camera)

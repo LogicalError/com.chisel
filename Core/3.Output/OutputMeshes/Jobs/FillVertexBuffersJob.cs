@@ -66,6 +66,8 @@ namespace Chisel.Core
         // the sections whose render mesh is the same as last time (no mesh is filled for them)
         [NoAlias, ReadOnly] public NativeArray<bool> keptSections;
         [NoAlias, ReadOnly] public NativeArray<uint> sectionLightmapHashes;
+        // the debug visualizations to make (bit i: kGeneratedDebugRendererFlags[i])
+        public int debugVisualizations;
         
 		// Write
 		[NoAlias, WriteOnly] public NativeList<Mesh.MeshData> meshes;
@@ -77,6 +79,25 @@ namespace Chisel.Core
         [NoAlias] public NativeList<ChiselMeshUpdate> meshUpdatesKept;
         [NoAlias] public NativeList<ChiselMeshUpdate> meshUpdatesKeptColliders;
 
+
+        // A debug visualization's query that debugVisualizations leaves out
+        public static bool HiddenDebugVisualization(MeshQuery meshQuery, int debugVisualizations)
+        {
+            if (meshQuery.LayerParameterIndex != SurfaceParameterIndex.None)
+                return false;
+            var index = DebugVisualizationIndex(meshQuery.LayerQuery, meshQuery.LayerQueryMask);
+            return index >= 0 && (debugVisualizations & (1 << index)) == 0;
+        }
+
+        static int DebugVisualizationIndex(SurfaceDestinationFlags query, SurfaceDestinationFlags mask)
+        {
+            for (int f = 0; f < kGeneratedDebugRendererFlags.Length; f++)
+            {
+                if (kGeneratedDebugRendererFlags[f].Item1 == query && kGeneratedDebugRendererFlags[f].Item2 == mask)
+                    return f;
+            }
+            return -1;
+        }
 
         [BurstDiscard]
         public static void InvalidQuery(SurfaceDestinationFlags query, SurfaceDestinationFlags mask)
@@ -99,23 +120,16 @@ namespace Chisel.Core
                     var subMeshSection = subMeshSections[i];
                     if (subMeshSection.meshQuery.LayerParameterIndex == SurfaceParameterIndex.None)
                     {
-                        int debugVisualizationIndex = -1;
                         var query   = subMeshSection.meshQuery.LayerQuery;
                         var mask    = subMeshSection.meshQuery.LayerQueryMask;
-                        for (int f = 0; f < kGeneratedDebugRendererFlags.Length; f++)
-                        {
-                            if (kGeneratedDebugRendererFlags[f].Item1 != query ||
-                                kGeneratedDebugRendererFlags[f].Item2 != mask)
-                                continue;
-
-                            debugVisualizationIndex = f;
-                            break;
-                        }
+                        var debugVisualizationIndex = DebugVisualizationIndex(query, mask);
                         if (debugVisualizationIndex == -1)
                         {
                             InvalidQuery(query, mask);
                             continue;
                         }
+                        if ((debugVisualizations & (1 << debugVisualizationIndex)) == 0)
+                            continue;
 
                         var meshUpdate = new ChiselMeshUpdate
                         {

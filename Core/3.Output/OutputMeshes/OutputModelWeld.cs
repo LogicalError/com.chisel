@@ -733,7 +733,8 @@ namespace Chisel.Core
                                                WeldScope scope, float3x2* pairs, float3* kept)
         {
             var count = int2.zero;
-            if (!brushes[b].brushRenderBuffer.IsCreated || !scope.Touches(b))
+            // an incremental update collapses by point group (OutputModelWeld.RecordIncremental)
+            if (!brushes[b].brushRenderBuffer.IsCreated || (scope.all.IsCreated && !scope.all.Value))
                 return count;
             var limitSq = kCollapseLength * kCollapseLength;
             var surfaceCount = brushes[b].brushRenderBuffer.Value.surfaces.Length;

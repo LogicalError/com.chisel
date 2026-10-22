@@ -83,7 +83,8 @@ namespace Chisel.Core
     }
 
     // Where a surface of a brush the weld changed differs from the brush's buffer: a triangle's corners (-1: dropped) or
-    // a vertex; root: the input triangle of the surface it belongs to, -1 for what the surface's splits added
+    // a vertex; root: the input triangle of the surface it belongs to, -1 for what the surface's splits added; at: where a
+    // triangle's corners are (WeldMemory.roundsAt)
     internal struct WeldEntry
     {
         public int  surface;
@@ -91,6 +92,7 @@ namespace Chisel.Core
         public int  index;
         public int  root;
         public int3 corners;
+        public int3x3 at;
         public float3       collider;
         public SelectVertex select;
         public RenderVertex render;
@@ -107,10 +109,10 @@ namespace Chisel.Core
         public UnsafeList<int>    surfaceStart;
         public UnsafeList<int3x3> corners;
         public UnsafeList<bool>   needle;
+        // what the rounds did to it (CancelOpposites, WeldNeedles), by the input triangle it belongs to
         public UnsafeList<WeldEntry> entries;
-        // this update: the entries the scope forgot, and where the ones recorded again start (RecordIncremental)
-        public UnsafeList<WeldEntry> forgotten;
-        public int recordedFrom;
+        // what the whole weld made of it (the rounds, the moves and the drops of the collapse), as its buffer was stored
+        public UnsafeList<WeldEntry> final;
 
         public void FreeInput()
         {
@@ -118,8 +120,8 @@ namespace Chisel.Core
             if (corners.IsCreated)      corners.Dispose();
             if (needle.IsCreated)       needle.Dispose();
             if (entries.IsCreated)      entries.Dispose();
-            if (forgotten.IsCreated)    forgotten.Dispose();
-            surfaceStart = default; corners = default; needle = default; entries = default; forgotten = default;
+            if (final.IsCreated)        final.Dispose();
+            surfaceStart = default; corners = default; needle = default; entries = default; final = default;
         }
     }
 
@@ -135,8 +137,13 @@ namespace Chisel.Core
         public NativeParallelMultiHashMap<int3, WeldShortLink> shortLinks;
         // (slot, surface) -> the input triangles its splits started from
         public NativeParallelMultiHashMap<long, int> splitRoots;
+        // the surfaces whose triangles the rounds rewrote or added have a corner here: (slot, surface), once per corner
+        public NativeParallelMultiHashMap<int3, long> roundsAt;
         // the collapse's moves, by the position moved
         public NativeParallelHashMap<int3, float3x2> moves;
+        // this update: the corners of the triangles the rounds were done again for, before and after (their point groups
+        // are clustered again)
+        public NativeList<int3> touched;
         public NativeReference<bool> valid;
         // what the last update welded: everything (-1) or this many triangles
         public NativeReference<int> lastScope;
@@ -157,7 +164,9 @@ namespace Chisel.Core
                 byTriple    = new NativeParallelMultiHashMap<OutputModelWeld.TriangleKey, WeldTriangle>(256, allocator),
                 shortLinks  = new NativeParallelMultiHashMap<int3, WeldShortLink>(64, allocator),
                 splitRoots  = new NativeParallelMultiHashMap<long, int>(16, allocator),
+                roundsAt    = new NativeParallelMultiHashMap<int3, long>(64, allocator),
                 moves       = new NativeParallelHashMap<int3, float3x2>(64, allocator),
+                touched     = new NativeList<int3>(64, allocator),
                 valid       = new NativeReference<bool>(allocator),
                 lastScope   = new NativeReference<int>(allocator),
                 scope       = new NativeParallelHashSet<WeldTriangle>(256, allocator),
@@ -177,7 +186,7 @@ namespace Chisel.Core
                 brush.output = default;
             }
             brushes.Clear(); freeSlots.Clear(); slotOf.Clear();
-            atPosition.Clear(); byTriple.Clear(); shortLinks.Clear(); splitRoots.Clear(); moves.Clear();
+            atPosition.Clear(); byTriple.Clear(); shortLinks.Clear(); splitRoots.Clear(); moves.Clear(); roundsAt.Clear(); touched.Clear();
             scope.Clear(); slotOfBrush.Clear();
             valid.Value = false;
         }
@@ -196,6 +205,8 @@ namespace Chisel.Core
             if (shortLinks.IsCreated)  shortLinks.Dispose();
             if (splitRoots.IsCreated)  splitRoots.Dispose();
             if (moves.IsCreated)       moves.Dispose();
+            if (roundsAt.IsCreated)    roundsAt.Dispose();
+            if (touched.IsCreated)     touched.Dispose();
             if (valid.IsCreated)       valid.Dispose();
             if (lastScope.IsCreated)   lastScope.Dispose();
             if (scope.IsCreated)       scope.Dispose();
@@ -311,9 +322,10 @@ namespace Chisel.Core
                     Unlink(ref memory, c.c0, c.c1, me);
                     Unlink(ref memory, c.c1, c.c2, me);
                     Unlink(ref memory, c.c2, c.c0, me);
-                    memory.moves.Remove(c.c0); memory.moves.Remove(c.c1); memory.moves.Remove(c.c2);
                 }
             }
+            for (int e = 0; brush.entries.IsCreated && e < brush.entries.Length; e++)
+                ForgetAt(ref memory, slot, brush.entries[e]);
             brush.FreeInput();
         }
 
@@ -332,9 +344,8 @@ namespace Chisel.Core
 
         // The scope grown, from the triangles in queue, to whole pieces, and to every split root of a surface one of whose
         // split roots it holds
-        static void Grow(ref WeldMemory memory, NativeList<WeldTriangle> queue, NativeParallelHashSet<int3> points)
+        static void Grow(ref WeldMemory memory, NativeList<WeldTriangle> queue)
         {
-            var stack = new NativeList<int3>(16, Allocator.Temp);
             for (int q = 0; q < queue.Length; q++)
             {
                 var t = queue[q];
@@ -358,28 +369,6 @@ namespace Chisel.Core
                                 Visit(ref memory, queue, other);
                         } while (memory.atPosition.TryGetNextValue(out other, ref it));
                     }
-                    // the point group: every triangle with a corner in it
-                    if (!memory.shortLinks.ContainsKey(p) || !points.Add(p))
-                        continue;
-                    stack.Clear();
-                    stack.Add(p);
-                    while (stack.Length > 0)
-                    {
-                        var point = stack[stack.Length - 1];
-                        stack.RemoveAt(stack.Length - 1);
-                        if (memory.atPosition.TryGetFirstValue(point, out other, out it))
-                        {
-                            do { Visit(ref memory, queue, other); } while (memory.atPosition.TryGetNextValue(out other, ref it));
-                        }
-                        if (memory.shortLinks.TryGetFirstValue(point, out var link, out var linkIt))
-                        {
-                            do
-                            {
-                                if (points.Add(link.to))
-                                    stack.Add(link.to);
-                            } while (memory.shortLinks.TryGetNextValue(out link, ref linkIt));
-                        }
-                    }
                 }
                 // the surface's splits go together
                 if (memory.splitRoots.TryGetFirstValue(Key(t), out var root, out var rootIt))
@@ -394,11 +383,10 @@ namespace Chisel.Core
                     }
                 }
             }
-            stack.Dispose();
         }
 
-        // What the weld did to the scope's triangles forgotten: their entries, what their surfaces' splits added, the moves
-        // at their corners; their brushes are stored again
+        // What the rounds did to the scope's triangles forgotten: their entries, what their surfaces' splits added; their
+        // corners are touched (RecordIncremental clusters their point groups again)
         static void ForgetScope(ref WeldMemory memory)
         {
             var slots = new NativeParallelHashSet<int>(64, Allocator.Temp);
@@ -409,7 +397,7 @@ namespace Chisel.Core
                     continue;
                 slots.Add(t.slot);
                 var c = brush.corners[brush.surfaceStart[t.surface] + t.triangle];
-                memory.moves.Remove(c.c0); memory.moves.Remove(c.c1); memory.moves.Remove(c.c2);
+                memory.touched.Add(c.c0); memory.touched.Add(c.c1); memory.touched.Add(c.c2);
             }
             foreach (var slot in slots)
             {
@@ -425,11 +413,7 @@ namespace Chisel.Core
                     if (!gone)
                         entries[kept++] = entry;
                     else
-                    {
-                        if (!brush.forgotten.IsCreated)
-                            brush.forgotten = new UnsafeList<WeldEntry>(entries.Length, Allocator.Persistent);
-                        brush.forgotten.Add(entry);
-                    }
+                        ForgetAt(ref memory, slot, entry);
                 }
                 entries.Resize(kept);
                 brush.entries = entries;
@@ -440,6 +424,19 @@ namespace Chisel.Core
                 }
             }
             slots.Dispose();
+        }
+
+        // A rounds entry's corners out of roundsAt, and touched
+        static void ForgetAt(ref WeldMemory memory, int slot, WeldEntry entry)
+        {
+            if (entry.vertex || entry.corners.x < 0)
+                return;
+            var key = Key(slot, entry.surface);
+            for (int i = 0; i < 3; i++)
+            {
+                RemoveOne(memory.roundsAt, entry.at[i], key);
+                memory.touched.Add(entry.at[i]);
+            }
         }
 
         static bool SplitsInScope(ref WeldMemory memory, int slot, int surface)
@@ -501,9 +498,8 @@ namespace Chisel.Core
             {
                 ref var brush = ref memory.brushes.ElementAt(i);
                 brush.live = brush.changed = brush.dirty = false;
-                if (brush.forgotten.IsCreated)
-                    brush.forgotten.Clear();
             }
+            memory.touched.Clear();
             memory.slotOfBrush.ResizeUninitialized(brushes.Length);
             var lastOrder = -1;
             for (int b = 0; b < brushes.Length; b++)
@@ -572,7 +568,6 @@ namespace Chisel.Core
             }
 
             var queue  = new NativeList<WeldTriangle>(256, Allocator.Temp);
-            var points = new NativeParallelHashSet<int3>(256, Allocator.Temp);
             // the pieces the changed brushes were in
             for (int slot = 0; slot < memory.brushes.Length; slot++)
             {
@@ -585,7 +580,7 @@ namespace Chisel.Core
                         Visit(ref memory, queue, new WeldTriangle { slot = slot, surface = s, triangle = t });
                 }
             }
-            Grow(ref memory, queue, points);
+            Grow(ref memory, queue);
             ForgetScope(ref memory);
 
             // the changed brushes taken out, the gone ones freed, the others read again
@@ -619,7 +614,6 @@ namespace Chisel.Core
             }
             memory.scope.Clear();
             queue.Clear();
-            points.Clear();
             for (int b = 0; b < brushes.Length; b++)
             {
                 var slot = memory.slotOfBrush[b];
@@ -643,11 +637,11 @@ namespace Chisel.Core
             }
             for (int i = 0; i < survivors.Length; i++)
                 Visit(ref memory, queue, survivors[i]);
-            Grow(ref memory, queue, points);
+            Grow(ref memory, queue);
             ForgetScope(ref memory);
             BuildScope(brushes, ref memory, ref state);
             memory.lastScope.Value = memory.scope.Count();
-            survivors.Dispose(); queue.Dispose(); points.Dispose();
+            survivors.Dispose(); queue.Dispose();
         }
 
         // After PlanWeldBeforeCollapse: a surface the scope split that another piece's splits added to as well takes that
@@ -671,9 +665,7 @@ namespace Chisel.Core
             var grew = queue.Length > 0;
             if (grew)
             {
-                var points = new NativeParallelHashSet<int3>(64, Allocator.Temp);
-                Grow(ref memory, queue, points);
-                points.Dispose();
+                Grow(ref memory, queue);
                 ForgetScope(ref memory);
                 BuildScope(brushes, ref memory, ref state);
                 memory.lastScope.Value = memory.scope.Count();
@@ -682,34 +674,39 @@ namespace Chisel.Core
             return grew;
         }
 
-        // After ApplyCollapse: what this update's weld did kept as entries of its brushes, then every brush stored again
-        // (state.copies) made from its buffer and entries; moves: every move the weld makes
-        public static void RecordIncremental(NativeList<BrushData> brushes, ref WeldMemory memory, ref WeldState state, NativeList<float3x2> moves)
+        // After the rounds (PlanWeldBeforeCollapse): what they did to the scope's surfaces kept as entries of their brushes,
+        // with where each triangle's corners are (roundsAt, touched)
+        public static void RecordRounds(NativeList<BrushData> brushes, ref WeldMemory memory, ref WeldState state)
         {
             var work = state.work;
-            for (int b = 0; b < brushes.Length; b++)
-            {
-                ref var brush = ref memory.brushes.ElementAt(memory.slotOfBrush[b]);
-                brush.recordedFrom = brush.entries.IsCreated ? brush.entries.Length : 0;
-            }
             for (int w = 0; w < work.Length; w++)
             {
                 var item = work[w];
+                if (item.CollapseOnly)
+                    continue;
                 var slot = memory.slotOfBrush[item.brush];
                 ref var brush = ref memory.brushes.ElementAt(slot);
                 brush.dirty = true;
                 ref var source = ref brushes[item.brush].brushRenderBuffer.Value.surfaces[item.surface];
-                var materialized = item.CollapseOnly;
-                if (materialized)
-                    item = Materialize(ref source, item, state.decisions);
                 var sourceTriangles = source.indices.Length / 3;
                 var sourceVertices  = source.colliderVertices.Length;
+                var key = Key(slot, item.surface);
                 for (int t = 0; t < item.indices.Length / 3; t++)
                 {
                     var corners = new int3(item.indices[t * 3], item.indices[t * 3 + 1], item.indices[t * 3 + 2]);
                     if (t < sourceTriangles && math.all(corners == new int3(source.indices[t * 3], source.indices[t * 3 + 1], source.indices[t * 3 + 2])))
                         continue;
-                    brush.entries.Add(new WeldEntry { surface = item.surface, index = t, root = t < sourceTriangles ? t : -1, corners = corners });
+                    var entry = new WeldEntry { surface = item.surface, index = t, root = t < sourceTriangles ? t : -1, corners = corners };
+                    if (corners.x >= 0)
+                    {
+                        entry.at = new int3x3(Bits(item.collider[corners.x]), Bits(item.collider[corners.y]), Bits(item.collider[corners.z]));
+                        for (int i = 0; i < 3; i++)
+                        {
+                            memory.roundsAt.Add(entry.at[i], key);
+                            memory.touched.Add(entry.at[i]);
+                        }
+                    }
+                    brush.entries.Add(entry);
                 }
                 // the first triangle left that uses each vertex, as an input triangle (-1: only what a split added does)
                 var firstUser = new NativeArray<int>(item.collider.Length, Allocator.Temp);
@@ -732,66 +729,401 @@ namespace Chisel.Core
                 if (item.splitRoots.IsCreated)
                 {
                     for (int r = 0; r < item.splitRoots.Length; r++)
-                        memory.splitRoots.Add(Key(slot, item.surface), item.splitRoots[r]);
-                }
-                if (materialized)
-                {
-                    item.indices.Dispose(); item.collider.Dispose(); item.select.Dispose(); item.render.Dispose();
+                        memory.splitRoots.Add(key, item.splitRoots[r]);
                 }
             }
+        }
+
+        // After ApplyCollapse: the collapse of the point groups the rounds touched (IncrementalWeld.md, step 3), then every
+        // brush near them or the rounds changed made again from its buffer, its rounds and the moves, stored again
+        // (state.copies) unless that is what it had; moves: every move the weld makes. Welding everything, the collapse
+        // jobs did it: what they made is kept.
+        public static void RecordIncremental(NativeList<BrushData> brushes, ref WeldMemory memory, ref WeldState state, NativeList<float3x2> moves)
+        {
+            if (state.scope.all.Value)
+            {
+                RecordFull(brushes, ref memory, ref state, moves);
+                return;
+            }
+            var limitSq = kCollapseLength * kCollapseLength;
+            var brushOfSlot = new NativeArray<int>(memory.brushes.Length, Allocator.Temp);
+            for (int i = 0; i < brushOfSlot.Length; i++)
+                brushOfSlot[i] = -1;
+            for (int b = 0; b < brushes.Length; b++)
+                brushOfSlot[memory.slotOfBrush[b]] = b;
+
+            // the point groups the rounds touched: every point linked to a touched one
+            var points = new NativeParallelHashSet<int3>(math.max(64, memory.touched.Length * 2), Allocator.Temp);
+            var stack  = new NativeList<int3>(64, Allocator.Temp);
+            for (int i = 0; i < memory.touched.Length; i++)
+            {
+                var p = memory.touched[i];
+                if (!memory.shortLinks.ContainsKey(p) || !points.Add(p))
+                    continue;
+                stack.Add(p);
+                while (stack.Length > 0)
+                {
+                    var q = stack[stack.Length - 1];
+                    stack.RemoveAt(stack.Length - 1);
+                    if (memory.shortLinks.TryGetFirstValue(q, out var link, out var it))
+                    {
+                        do
+                        {
+                            if (points.Add(link.to))
+                                stack.Add(link.to);
+                        } while (memory.shortLinks.TryGetNextValue(out link, ref it));
+                    }
+                }
+            }
+            stack.Dispose();
+
+            // the surfaces with a triangle, as the rounds left it, with a corner in them: (brush, surface)
+            var surfaces = new NativeParallelHashSet<long>(64, Allocator.Temp);
+            foreach (var p in points)
+            {
+                if (memory.atPosition.TryGetFirstValue(p, out var triangle, out var it))
+                {
+                    do
+                    {
+                        var b = brushOfSlot[triangle.slot];
+                        if (b >= 0) surfaces.Add(Key(b, triangle.surface));
+                    } while (memory.atPosition.TryGetNextValue(out triangle, ref it));
+                }
+                if (memory.roundsAt.TryGetFirstValue(p, out var key, out var kit))
+                {
+                    do
+                    {
+                        var b = brushOfSlot[(int)(key >> 32)];
+                        if (b >= 0) surfaces.Add(Key(b, (int)(uint)key));
+                    } while (memory.roundsAt.TryGetNextValue(out key, ref kit));
+                }
+            }
+
+            // their short edges and kept corners (ShortEdgesOf), clustered (ClusterShortEdges)
+            var pairs = new NativeList<float3x2>(64, Allocator.Temp);
+            var kept  = new UnsafeHashSet<float3>(64, Allocator.Temp);
+            foreach (var key in surfaces)
+            {
+                var b = (int)(key >> 32);
+                var s = (int)(uint)key;
+                ref var source = ref brushes[b].brushRenderBuffer.Value.surfaces[s];
+                // a decal's pieces follow the corners that move, but their short edges do not move anything
+                if (source.decalEntityID != 0)
+                    continue;
+                var after = AfterRounds(brushes, ref memory, ref state, b, s, Allocator.Temp, out var temporary);
+                var sourceTriangles = source.indices.Length / 3;
+                for (int t = 0; t < after.indices.Length / 3; t++)
+                {
+                    var c0 = after.indices[t * 3]; var c1 = after.indices[t * 3 + 1]; var c2 = after.indices[t * 3 + 2];
+                    if (c0 < 0)
+                        continue;
+                    var q0 = after.collider[c0] + 0.0f;
+                    var q1 = after.collider[c1] + 0.0f;
+                    var q2 = after.collider[c2] + 0.0f;
+                    if (!points.Contains(Bits(q0)) && !points.Contains(Bits(q1)) && !points.Contains(Bits(q2)))
+                        continue;
+                    var changed = t >= sourceTriangles ||
+                                  c0 != source.indices[t * 3] || c1 != source.indices[t * 3 + 1] || c2 != source.indices[t * 3 + 2];
+                    if (IsNeedle(q0, q1, q2) || changed)
+                    {
+                        kept.Add(q0); kept.Add(q1); kept.Add(q2);
+                        continue;
+                    }
+                    // a short edge's corners are in one point group: those of the groups not clustered again stay out
+                    AddShort(pairs, points, q0, q1, limitSq); AddShort(pairs, points, q1, q2, limitSq); AddShort(pairs, points, q2, q0, limitSq);
+                }
+                if (temporary)
+                    FreeWorking(after);
+            }
+            var movedNow = new NativeList<float3x2>(64, Allocator.Temp);
+            ClusterPairs(pairs, kept, movedNow);
+            pairs.Dispose(); kept.Dispose();
+
+            // the moves of those groups, and of the corners that are not in one any more, replaced
+            for (int i = 0; i < memory.touched.Length; i++)
+                memory.moves.Remove(memory.touched[i]);
+            foreach (var p in points)
+                memory.moves.Remove(p);
+            for (int i = 0; i < movedNow.Length; i++)
+                memory.moves[Bits(movedNow[i].c0)] = movedNow[i];
+            movedNow.Dispose();
             if (moves.IsCreated)
             {
-                for (int m = 0; m < moves.Length; m++)
-                    memory.moves[Bits(moves[m].c0)] = moves[m];
                 moves.Clear();
                 foreach (var pair in memory.moves)
                     moves.Add(pair.Value);
             }
 
-            // the brushes stored again, each from its buffer and entries (welding everything, what the weld made is that)
-            if (state.scope.all.Value)
-                return;
-            // a brush whose input stayed and that the weld made the same of again keeps the buffer it has
-            for (int b = 0; b < brushes.Length; b++)
-            {
-                ref var brush = ref memory.brushes.ElementAt(memory.slotOfBrush[b]);
-                if (brush.dirty && !brush.changed && SameAgain(ref brush))
-                    brush.dirty = false;
-            }
+            // every brush near them made again; one the same as it was keeps its buffer
+            foreach (var key in surfaces)
+                memory.brushes.ElementAt(memory.slotOfBrush[(int)(key >> 32)]).dirty = true;
             WeldState.FreeWork(state.work);
             state.work.Clear();
             state.workIndex.Clear();
             state.copies.Clear();
             state.decisions.Clear();
+            var final = new NativeList<WeldEntry>(64, Allocator.Temp);
             for (int b = 0; b < brushes.Length; b++)
             {
                 ref var brush = ref memory.brushes.ElementAt(memory.slotOfBrush[b]);
-                if (!brush.dirty || brush.entries.Length == 0)
+                if (!brush.dirty)
                     continue;
-                for (int e = 0; e < brush.entries.Length; e++)
+                var first = state.work.Length;
+                final.Clear();
+                ref var surfacesOf = ref brushes[b].brushRenderBuffer.Value.surfaces;
+                for (int s = 0; s < surfacesOf.Length; s++)
                 {
-                    var entry = brush.entries[e];
-                    var w = WorkOn(brushes, state.work, state.workIndex, b, entry.surface);
-                    ref var copy = ref state.work.ElementAt(w);
-                    if (entry.vertex)
+                    var copy = AfterRounds(brushes, ref memory, ref state, b, s, Allocator.Persistent, out _);
+                    if (!Collapse(ref memory, ref copy) && !HasRounds(ref brush, s))
                     {
-                        while (copy.collider.Length <= entry.index)
+                        FreeWorking(copy);
+                        continue;
+                    }
+                    copy.brush = b;
+                    copy.surface = s;
+                    state.workIndex.TryAdd(Key(b, s), state.work.Length);
+                    state.work.Add(copy);
+                    Diff(ref surfacesOf[s], copy, final);
+                }
+                if (!brush.changed && SameEntries(brush.final, final))
+                {
+                    brush.dirty = false;
+                    for (int w = first; w < state.work.Length; w++)
+                    {
+                        state.workIndex.Remove(Key(b, state.work[w].surface));
+                        FreeWorking(state.work[w]);
+                    }
+                    state.work.ResizeUninitialized(first);
+                    continue;
+                }
+                SetFinal(ref brush, final);
+                if (state.work.Length > first)
+                    state.copies.Add(new WeldCopy { brush = b });
+            }
+            final.Dispose();
+            surfaces.Dispose(); points.Dispose(); brushOfSlot.Dispose();
+        }
+
+        // Welding everything: the moves the collapse made, and what the weld made of every brush
+        static void RecordFull(NativeList<BrushData> brushes, ref WeldMemory memory, ref WeldState state, NativeList<float3x2> moves)
+        {
+            memory.moves.Clear();
+            if (moves.IsCreated)
+            {
+                for (int m = 0; m < moves.Length; m++)
+                    memory.moves[Bits(moves[m].c0)] = moves[m];
+            }
+            var final = new NativeList<WeldEntry>(64, Allocator.Temp);
+            for (int b = 0; b < brushes.Length; b++)
+            {
+                ref var brush = ref memory.brushes.ElementAt(memory.slotOfBrush[b]);
+                final.Clear();
+                if (brushes[b].brushRenderBuffer.IsCreated)
+                {
+                    ref var surfacesOf = ref brushes[b].brushRenderBuffer.Value.surfaces;
+                    for (int s = 0; s < surfacesOf.Length; s++)
+                    {
+                        var w = Find(state.workIndex, b, s);
+                        if (w < 0)
+                            continue;
+                        var item = state.work[w];
+                        if (item.CollapseOnly)
                         {
-                            copy.collider.Add(default); copy.select.Add(default); copy.render.Add(default);
-                        }
-                        copy.collider[entry.index] = entry.collider;
-                        copy.select[entry.index]   = entry.select;
-                        copy.render[entry.index]   = entry.render;
-                    } else
-                    {
-                        while (copy.indices.Length < entry.index * 3 + 3)
-                            copy.indices.Add(-1);
-                        copy.indices[entry.index * 3]     = entry.corners.x;
-                        copy.indices[entry.index * 3 + 1] = entry.corners.y;
-                        copy.indices[entry.index * 3 + 2] = entry.corners.z;
+                            var made = Materialize(ref surfacesOf[s], item, state.decisions);
+                            Diff(ref surfacesOf[s], made, final);
+                            made.indices.Dispose(); made.collider.Dispose(); made.select.Dispose(); made.render.Dispose();
+                        } else
+                            Diff(ref surfacesOf[s], item, final);
                     }
                 }
-                state.copies.Add(new WeldCopy { brush = b });
+                SetFinal(ref brush, final);
+            }
+            final.Dispose();
+        }
+
+        static void SetFinal(ref WeldBrush brush, NativeList<WeldEntry> final)
+        {
+            if (!brush.final.IsCreated)
+                brush.final = new UnsafeList<WeldEntry>(final.Length, Allocator.Persistent);
+            brush.final.Clear();
+            for (int i = 0; i < final.Length; i++)
+                brush.final.Add(final[i]);
+        }
+
+        static bool HasRounds(ref WeldBrush brush, int surface)
+        {
+            for (int e = 0; brush.entries.IsCreated && e < brush.entries.Length; e++)
+            {
+                if (brush.entries[e].surface == surface)
+                    return true;
+            }
+            return false;
+        }
+
+        static void AddShort(NativeList<float3x2> pairs, NativeParallelHashSet<int3> points, float3 x, float3 y, float limitSq)
+        {
+            var d = math.distancesq(x, y);
+            if (!(d > 0) || !(d < limitSq) || !points.Contains(Bits(x)))
+                return;
+            pairs.Add(new float3x2(x, y));
+        }
+
+        // ClusterShortEdges for these short edges and kept corners: (from, to) of every corner that moves
+        static void ClusterPairs(NativeList<float3x2> pairs, UnsafeHashSet<float3> keptPoints, NativeList<float3x2> moved)
+        {
+            var ids    = new UnsafeHashMap<float3, int>(64, Allocator.Temp);
+            var points = new NativeList<float3>(64, Allocator.Temp);
+            var edges  = new NativeList<ShortEdge>(64, Allocator.Temp);
+            int IdOf(float3 p)
+            {
+                if (!ids.TryGetValue(p, out var id)) { id = points.Length; ids.Add(p, id); points.Add(p); }
+                return id;
+            }
+            for (int e = 0; e < pairs.Length; e++)
+            {
+                var x = pairs[e].c0; var y = pairs[e].c1;
+                if (keptPoints.Contains(x) || keptPoints.Contains(y))
+                    continue;
+                int a = IdOf(x), c = IdOf(y);
+                edges.Add(new ShortEdge { a = math.min(a, c), b = math.max(a, c), length = math.distance(x, y) });
+            }
+            if (edges.Length > 0)
+            {
+                var to = new NativeArray<float3>(points.Length, Allocator.Temp);
+                Cluster(points.AsArray(), edges, to);
+                for (int i = 0; i < points.Length; i++)
+                {
+                    if (!to[i].Equals(points[i]))
+                        moved.Add(new float3x2(points[i], to[i]));
+                }
+                to.Dispose();
+            }
+            edges.Dispose(); points.Dispose(); ids.Dispose();
+        }
+
+        // A surface as the rounds left it: the run's working copy, or the buffer with the rounds kept for it
+        static unsafe Working AfterRounds(NativeList<BrushData> brushes, ref WeldMemory memory, ref WeldState state, int b, int s, Allocator allocator,
+                                          out bool temporary)
+        {
+            var w = Find(state.workIndex, b, s);
+            ref var source = ref brushes[b].brushRenderBuffer.Value.surfaces[s];
+            var copy = new Working { brush = b, surface = s };
+            if (w >= 0 && allocator == Allocator.Temp && !state.work[w].CollapseOnly)
+            {
+                temporary = false;
+                return state.work[w];
+            }
+            temporary = true;
+            copy.indices  = new UnsafeList<int>(source.indices.Length, allocator);
+            copy.collider = new UnsafeList<float3>(source.colliderVertices.Length, allocator);
+            copy.select   = new UnsafeList<SelectVertex>(source.selectVertices.Length, allocator);
+            copy.render   = new UnsafeList<RenderVertex>(source.renderVertices.Length, allocator);
+            copy.indices .AddRange(source.indices.GetUnsafePtr(),          source.indices.Length);
+            copy.collider.AddRange(source.colliderVertices.GetUnsafePtr(), source.colliderVertices.Length);
+            copy.select  .AddRange(source.selectVertices.GetUnsafePtr(),   source.selectVertices.Length);
+            copy.render  .AddRange(source.renderVertices.GetUnsafePtr(),   source.renderVertices.Length);
+            ref var brush = ref memory.brushes.ElementAt(memory.slotOfBrush[b]);
+            for (int e = 0; brush.entries.IsCreated && e < brush.entries.Length; e++)
+            {
+                var entry = brush.entries[e];
+                if (entry.surface != s)
+                    continue;
+                if (entry.vertex)
+                {
+                    while (copy.collider.Length <= entry.index)
+                    {
+                        copy.collider.Add(default); copy.select.Add(default); copy.render.Add(default);
+                    }
+                    copy.collider[entry.index] = entry.collider;
+                    copy.select[entry.index]   = entry.select;
+                    copy.render[entry.index]   = entry.render;
+                } else
+                {
+                    while (copy.indices.Length < entry.index * 3 + 3)
+                        copy.indices.Add(-1);
+                    copy.indices[entry.index * 3]     = entry.corners.x;
+                    copy.indices[entry.index * 3 + 1] = entry.corners.y;
+                    copy.indices[entry.index * 3 + 2] = entry.corners.z;
+                }
+            }
+            return copy;
+        }
+
+        static void FreeWorking(Working item)
+        {
+            if (item.indices.IsCreated)  item.indices.Dispose();
+            if (item.collider.IsCreated) item.collider.Dispose();
+            if (item.select.IsCreated)   item.select.Dispose();
+            if (item.render.IsCreated)   item.render.Dispose();
+            if (item.splitRoots.IsCreated) item.splitRoots.Dispose();
+        }
+
+        // The collapse of one surface as the rounds left it (DecideCollapse, ApplyCollapse): a triangle with a corner that
+        // moves and left without area dropped, the corners of the triangles left that move moved; false when nothing moves
+        static bool Collapse(ref WeldMemory memory, ref Working copy)
+        {
+            var count = copy.collider.Length;
+            if (count == 0 || memory.moves.Count() == 0)
+                return false;
+            var targets = new NativeArray<float3>(count, Allocator.Temp);
+            var movedAt = new NativeArray<bool>(count, Allocator.Temp);
+            var any = false;
+            for (int v = 0; v < count; v++)
+            {
+                if (!memory.moves.TryGetValue(Bits(copy.collider[v] + 0.0f), out var move))
+                    continue;
+                targets[v] = move.c1;
+                movedAt[v] = true;
+                any = true;
+            }
+            if (any)
+            {
+                for (int t = 0; t + 2 < copy.indices.Length; t += 3)
+                {
+                    var c0 = copy.indices[t]; var c1 = copy.indices[t + 1]; var c2 = copy.indices[t + 2];
+                    if (c0 < 0 || (!movedAt[c0] && !movedAt[c1] && !movedAt[c2]))
+                        continue;
+                    var p0 = movedAt[c0] ? targets[c0] : copy.collider[c0];
+                    var p1 = movedAt[c1] ? targets[c1] : copy.collider[c1];
+                    var p2 = movedAt[c2] ? targets[c2] : copy.collider[c2];
+                    if (OutputWeld.WithoutArea(p0, p1, p2))
+                        copy.indices[t] = copy.indices[t + 1] = copy.indices[t + 2] = -1;
+                }
+                var used = new NativeArray<bool>(count, Allocator.Temp);
+                for (int t = 0; t + 2 < copy.indices.Length; t += 3)
+                {
+                    if (copy.indices[t] < 0)
+                        continue;
+                    used[copy.indices[t]] = used[copy.indices[t + 1]] = used[copy.indices[t + 2]] = true;
+                }
+                for (int v = 0; v < count; v++)
+                {
+                    if (used[v] && movedAt[v])
+                        MoveCorner(ref copy, v, targets[v]);
+                }
+                used.Dispose();
+            }
+            targets.Dispose(); movedAt.Dispose();
+            return any;
+        }
+
+        // Where a surface of the weld's differs from the buffer's (as final entries)
+        static void Diff(ref ChiselSurfaceRenderBuffer source, Working item, NativeList<WeldEntry> final)
+        {
+            var sourceTriangles = source.indices.Length / 3;
+            var sourceVertices  = source.colliderVertices.Length;
+            for (int t = 0; t < item.indices.Length / 3; t++)
+            {
+                var corners = new int3(item.indices[t * 3], item.indices[t * 3 + 1], item.indices[t * 3 + 2]);
+                if (t < sourceTriangles && math.all(corners == new int3(source.indices[t * 3], source.indices[t * 3 + 1], source.indices[t * 3 + 2])))
+                    continue;
+                final.Add(new WeldEntry { surface = item.surface, index = t, corners = corners });
+            }
+            for (int v = 0; v < item.collider.Length; v++)
+            {
+                if (v < sourceVertices && SameVertex(ref source, v, item))
+                    continue;
+                final.Add(new WeldEntry { surface = item.surface, vertex = true, index = v, collider = item.collider[v], select = item.select[v], render = item.render[v] });
             }
         }
 
@@ -805,27 +1137,26 @@ namespace Chisel.Core
             }
         }
 
-        // The entries recorded again are the ones the scope forgot: what Copy makes of them is the same
-        static unsafe bool SameAgain(ref WeldBrush brush)
+        // The same final entries: what Copy makes of them is the same
+        static unsafe bool SameEntries(UnsafeList<WeldEntry> before, NativeList<WeldEntry> now)
         {
-            var again = brush.entries.Length - brush.recordedFrom;
-            var forgot = brush.forgotten.IsCreated ? brush.forgotten.Length : 0;
-            if (again != forgot)
+            var count = before.IsCreated ? before.Length : 0;
+            if (count != now.Length)
                 return false;
-            if (again == 0)
+            if (count == 0)
                 return true;
-            var a = new NativeArray<WeldEntry>(again, Allocator.Temp);
-            var f = new NativeArray<WeldEntry>(again, Allocator.Temp);
+            var a = new NativeArray<WeldEntry>(count, Allocator.Temp);
+            var f = new NativeArray<WeldEntry>(count, Allocator.Temp);
             try
             {
-                for (int i = 0; i < again; i++)
+                for (int i = 0; i < count; i++)
                 {
-                    a[i] = brush.entries[brush.recordedFrom + i];
-                    f[i] = brush.forgotten[i];
+                    a[i] = now[i];
+                    f[i] = before[i];
                 }
                 a.Sort(new BySurfaceAndIndex());
                 f.Sort(new BySurfaceAndIndex());
-                for (int i = 0; i < again; i++)
+                for (int i = 0; i < count; i++)
                 {
                     var x = a[i]; var y = f[i];
                     if (x.surface != y.surface || x.vertex != y.vertex || x.index != y.index)
@@ -968,6 +1299,7 @@ namespace Chisel.Core
                 do
                     PlanWeldBeforeCollapse(brushes, ref state, out _, out _, out _, moves);
                 while (TakeInSplitSurfaces(brushes, ref memory, ref state));
+                RecordRounds(brushes, ref memory, ref state);
                 Collapse(brushes, ref state, moves);
                 RecordIncremental(brushes, ref memory, ref state, moves);
                 var copies = state.copies.AsArray();

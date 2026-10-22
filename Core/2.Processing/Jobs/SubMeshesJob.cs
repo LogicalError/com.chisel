@@ -147,6 +147,7 @@ namespace Chisel.Core
             do
                 OutputModelWeld.PlanWeldBeforeCollapse(brushRenderData, ref weld, out _, out _, out _, collapseMoves);
             while (OutputModelWeld.TakeInSplitSurfaces(brushRenderData, ref weldMemory, ref weld));
+            OutputModelWeld.RecordRounds(brushRenderData, ref weldMemory, ref weld);
         }
     }
 

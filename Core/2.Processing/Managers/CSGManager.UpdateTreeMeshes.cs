@@ -2749,21 +2749,43 @@ namespace Chisel.Core
                 using (kJob_PrepareSubSectionsProfilerMarker.Auto())
                 {
                     const bool runInParallel = runInParallelDefault;
-                    var prepareSubSectionsJob = new PrepareSubSectionsJob
+                    var ranges      = new NativeArray<PrepareSubSections.RangeGroups>(PrepareSubSections.kRangeCount * Temporaries.meshQueriesLength, defaultAllocator);
+                    var rangeChunks = new NativeArray<UnsafeList<uint>>(PrepareSubSections.kRangeCount, defaultAllocator);
+                    new PrepareSubSectionKeysJob
                     {
-                        // Read
                         meshQueries     = Temporaries.meshQueries,
                         brushRenderData = Temporaries.brushRenderData,
-
-                        // Write
                         allocator       = defaultAllocator,
-                        subMeshSurfaces = Temporaries.subMeshSurfaces,
-                    };
-                    prepareSubSectionsJob.Schedule(runInParallel,
+                        ranges          = ranges,
+                        rangeChunks     = rangeChunks
+                    }.Schedule(runInParallel, PrepareSubSections.kRangeCount, 1,
                         JobHandles.Read(
                             JobHandleType.meshQueriesJobHandle,
                             JobHandleType.brushRenderDataJobHandle),
                         JobHandles.Write(JobHandleType.subMeshSurfacesJobHandle));
+                    new PrepareSubSectionsJob
+                    {
+                        meshQueries     = Temporaries.meshQueries,
+                        allocator       = defaultAllocator,
+                        ranges          = ranges,
+                        subMeshSurfaces = Temporaries.subMeshSurfaces,
+                    }.Schedule(runInParallel, Temporaries.meshQueriesLength, 1,
+                        JobHandles.Read(JobHandleType.meshQueriesJobHandle),
+                        JobHandles.Write(JobHandleType.subMeshSurfacesJobHandle));
+                    var scatterHandle = new ScatterSubSectionsJob
+                    {
+                        meshQueries     = Temporaries.meshQueries,
+                        brushRenderData = Temporaries.brushRenderData,
+                        subMeshSurfaces = Temporaries.subMeshSurfaces,
+                        ranges          = ranges,
+                        rangeChunks     = rangeChunks
+                    }.Schedule(runInParallel, PrepareSubSections.kRangeCount, 1,
+                        JobHandles.Read(
+                            JobHandleType.meshQueriesJobHandle,
+                            JobHandleType.brushRenderDataJobHandle),
+                        JobHandles.Write(JobHandleType.subMeshSurfacesJobHandle));
+                    ranges.Dispose(scatterHandle);
+                    rangeChunks.Dispose(scatterHandle);
                 }
                 #endregion
 

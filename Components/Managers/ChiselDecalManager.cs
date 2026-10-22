@@ -29,6 +29,7 @@ namespace Chisel.Components
         struct DecalState
         {
             public ChiselModelComponent    parentModel;
+            public Transform               transform;
             public ulong                   entityID;
             public ulong                   renderMaterial;
             public SurfaceDestinationFlags destinationFlags;
@@ -39,6 +40,8 @@ namespace Chisel.Components
         sealed class ModelState
         {
             public CSGTree tree;
+            // this update's model.transform.worldToLocalMatrix
+            public Matrix4x4 worldToLocal;
             public readonly List<ChiselDecalInstance> decals = new();
             public readonly List<ChiselDecalTarget>   targets = new();
             public readonly List<ChiselDecalInstance> previous = new();
@@ -152,6 +155,7 @@ namespace Chisel.Components
                         state.previous.Clear();
                         s_Dirty = true;
                     }
+                    state.worldToLocal = model.transform.worldToLocalMatrix;
                     state.decals.Clear();
                     state.targets.Clear();
                 }
@@ -191,6 +195,7 @@ namespace Chisel.Components
                         s_DecalStates[decal] = new DecalState
                         {
                             parentModel      = decal.GetComponentInParent<ChiselModelComponent>(),
+                            transform        = decal.transform,
                             entityID         = EntityId.ToULong(decal.GetEntityId()),
                             renderMaterial   = EntityId.ToULong(decal.Material.GetEntityId()),
                             destinationFlags = GetDestinationFlags(decal.Material),
@@ -207,14 +212,17 @@ namespace Chisel.Components
                     if (decalState.parentModel != null)
                     {
                         if (s_Models.TryGetValue(decalState.parentModel, out var state))
-                            Add(state, Describe(decal, decalState, decalState.parentModel), decalState.targets);
+                            Add(state, Describe(decal, decalState, state.worldToLocal), decalState.targets);
                         continue;
                     }
                     var scene = decal.gameObject.scene;
                     foreach (var model in s_ModelList)
                     {
                         if (model.gameObject.scene == scene)
-                            Add(s_Models[model], Describe(decal, decalState, model), decalState.targets);
+                        {
+                            var state = s_Models[model];
+                            Add(state, Describe(decal, decalState, state.worldToLocal), decalState.targets);
+                        }
                     }
                 }
 
@@ -277,10 +285,10 @@ namespace Chisel.Components
             return true;
         }
 
-        static ChiselDecalInstance Describe(ChiselDecalComponent decal, in DecalState decalState, ChiselModelComponent model)
+        static ChiselDecalInstance Describe(ChiselDecalComponent decal, in DecalState decalState, Matrix4x4 modelWorldToLocal)
         {
             // The tree's space is the model's own space
-            var decalToTree = model.transform.worldToLocalMatrix * decal.transform.localToWorldMatrix;
+            var decalToTree = modelWorldToLocal * decalState.transform.localToWorldMatrix;
             return new ChiselDecalInstance
             {
                 entityID         = decalState.entityID,

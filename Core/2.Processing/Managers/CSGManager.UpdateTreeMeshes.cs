@@ -2862,17 +2862,29 @@ namespace Chisel.Core
                 Temporaries.keptSections          = new NativeArray<bool>(math.max(1, sections.Length), defaultAllocator);
                 Temporaries.sectionLightmapHashes = new NativeArray<uint>(math.max(1, sections.Length), defaultAllocator);
                 using var kept = new NativeReference<int>(Allocator.TempJob);
-                new FindKeptSectionsJob
+                using var sectionHashes = new NativeArray<uint4>(math.max(1, sections.Length), Allocator.TempJob);
+                using var hashed        = new NativeArray<bool>(math.max(1, sections.Length), Allocator.TempJob);
+                var hashing = new FindKeptSectionHashesJob
                 {
                     sections              = sections,
                     descriptions          = Temporaries.subMeshDescriptions,
                     subMeshSurfaces       = Temporaries.subMeshSurfaces,
                     lightmapUVSettings    = lightmapUVSettings,
-                    hashes                = hashes,
-                    keptSections          = Temporaries.keptSections,
+                    keeping               = hashes.IsCreated,
                     sectionLightmapHashes = Temporaries.sectionLightmapHashes,
-                    kept                  = kept
-                }.Run();
+                    sectionHashes         = sectionHashes,
+                    hashed                = hashed
+                }.Schedule(sections.Length, 1);
+                new FindKeptSectionsJob
+                {
+                    sections      = sections,
+                    descriptions  = Temporaries.subMeshDescriptions,
+                    sectionHashes = sectionHashes,
+                    hashed        = hashed,
+                    hashes        = hashes,
+                    keptSections  = Temporaries.keptSections,
+                    kept          = kept
+                }.Schedule(hashing).Complete();
                 return kept.Value;
             }
 

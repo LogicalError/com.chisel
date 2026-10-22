@@ -236,36 +236,36 @@ namespace Chisel.Core
     // Marks the sections whose mesh is made from the same as last time (keptSections), remembers what each was made from,
     // and gives each render mesh the hash of what its lightmap layout is made from (sectionLightmapHashes); kept: how
     // many are kept. A query's own material meshes and the colliders are kept; the shadow-only and debug meshes are
-    // always made again.
+    // always made again. Section by section, in parallel, what each is made from (sectionHashes, FindKeptSectionHashesJob),
+    // then FindKeptSectionsJob
     [BurstCompile(CompileSynchronously = true)]
-    unsafe struct FindKeptSectionsJob : IJob
+    unsafe struct FindKeptSectionHashesJob : IJobParallelFor
     {
         [NoAlias, ReadOnly] public NativeList<SubMeshSection>                sections;
         [NoAlias, ReadOnly] public NativeList<SubMeshDescriptions>           descriptions;
         [NoAlias, ReadOnly] public NativeArray<UnsafeList<SubMeshSurface>>   subMeshSurfaces;
         public LightmapUVSettings lightmapUVSettings;
+        public bool keeping;
 
-        [NoAlias] public NativeParallelHashMap<RenderMeshKey, uint4> hashes;
-        [NoAlias] public NativeArray<bool>   keptSections;
         [NoAlias] public NativeArray<uint>   sectionLightmapHashes;
-        [NoAlias] public NativeReference<int> kept;
+        // what a section that can be kept is made from (hashed: true)
+        [NoAlias] public NativeArray<uint4>  sectionHashes;
+        [NoAlias] public NativeArray<bool>   hashed;
 
-        public void Execute()
+        public void Execute(int i)
         {
-            var seen   = new NativeParallelHashSet<RenderMeshKey>(math.max(1, sections.Length), Allocator.Temp);
             var buffer = new UnsafeAppendBuffer(256, 16, Allocator.Temp);
-            var count  = 0;
-            for (int i = 0; i < sections.Length; i++)
+            try
             {
                 var section  = sections[i];
                 var collider = section.meshQuery.LayerParameterIndex == SurfaceParameterIndex.PhysicsMaterial;
                 var render   = section.meshQuery.LayerParameterIndex == SurfaceParameterIndex.RenderMaterial;
                 if (render)
                     sectionLightmapHashes[i] = LightmapHash(section, ref buffer);
-                if (!hashes.IsCreated ||
+                if (!keeping ||
                     !(collider || GatherSurfacesJob.OneMeshPerMaterial(section.meshQuery)) ||
                     (render && section.endIndex - section.startIndex != 1))
-                    continue;
+                    return;
                 // a collider's section is the one description it starts at
                 var description = descriptions[section.startIndex];
                 buffer.Reset();
@@ -286,30 +286,13 @@ namespace Chisel.Core
                     if (collider && surfaces[s].brushRenderBuffer.IsCreated)
                         buffer.Add(surfaces[s].brushRenderBuffer.Value.surfaces[surfaces[s].surfaceIndex].shapeHashValue);
                 }
-                var hash = xxHash3.Hash128(buffer.Ptr, buffer.Length);
-                var key  = new RenderMeshKey { query = (int)section.meshQuery.LayerQuery, surfaceParameter = description.surfaceParameter, chunk = description.chunk };
-                if (!seen.Add(key))
-                    continue;
-                if (hashes.TryGetValue(key, out var last) && last.Equals(hash))
-                {
-                    keptSections[i] = true;
-                    count++;
-                }
-                hashes[key] = hash;
+                sectionHashes[i] = xxHash3.Hash128(buffer.Ptr, buffer.Length);
+                hashed[i] = true;
             }
-            if (hashes.IsCreated)
+            finally
             {
-                // the meshes this update does not have any more
-                using var keys = hashes.GetKeyArray(Allocator.Temp);
-                for (int k = 0; k < keys.Length; k++)
-                {
-                    if (!seen.Contains(keys[k]))
-                        hashes.Remove(keys[k]);
-                }
+                buffer.Dispose();
             }
-            buffer.Dispose();
-            seen.Dispose();
-            kept.Value = count;
         }
 
         // What a render mesh's lightmap layout is made from (ChiselOutputRenderable): each surface's chart, which the
@@ -335,6 +318,54 @@ namespace Chisel.Core
                 }
             }
             return xxHash3.Hash64(buffer.Ptr, buffer.Length).x;
+        }
+    }
+
+    [BurstCompile(CompileSynchronously = true)]
+    struct FindKeptSectionsJob : IJob
+    {
+        [NoAlias, ReadOnly] public NativeList<SubMeshSection>                sections;
+        [NoAlias, ReadOnly] public NativeList<SubMeshDescriptions>           descriptions;
+        [NoAlias, ReadOnly] public NativeArray<uint4>  sectionHashes;
+        [NoAlias, ReadOnly] public NativeArray<bool>   hashed;
+
+        [NoAlias] public NativeParallelHashMap<RenderMeshKey, uint4> hashes;
+        [NoAlias] public NativeArray<bool>   keptSections;
+        [NoAlias] public NativeReference<int> kept;
+
+        public void Execute()
+        {
+            var seen  = new NativeParallelHashSet<RenderMeshKey>(math.max(1, sections.Length), Allocator.Temp);
+            var count = 0;
+            for (int i = 0; i < sections.Length; i++)
+            {
+                if (!hashed[i])
+                    continue;
+                var section     = sections[i];
+                var description = descriptions[section.startIndex];
+                var hash = sectionHashes[i];
+                var key  = new RenderMeshKey { query = (int)section.meshQuery.LayerQuery, surfaceParameter = description.surfaceParameter, chunk = description.chunk };
+                if (!seen.Add(key))
+                    continue;
+                if (hashes.TryGetValue(key, out var last) && last.Equals(hash))
+                {
+                    keptSections[i] = true;
+                    count++;
+                }
+                hashes[key] = hash;
+            }
+            if (hashes.IsCreated)
+            {
+                // the meshes this update does not have any more
+                using var keys = hashes.GetKeyArray(Allocator.Temp);
+                for (int k = 0; k < keys.Length; k++)
+                {
+                    if (!seen.Contains(keys[k]))
+                        hashes.Remove(keys[k]);
+                }
+            }
+            seen.Dispose();
+            kept.Value = count;
         }
     }
 

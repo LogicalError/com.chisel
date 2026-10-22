@@ -64,6 +64,8 @@ namespace Chisel.Core
 
         public ulong                    entityID;
         public int                      order;
+        // where the decal was in the list given to SetDecals: what stacks decals of the same order
+        public int                      sequence;
         public DecalVolumeFlags         flags;
         public ulong                    renderMaterial;
         public SurfaceDestinationFlags  materialFlags;

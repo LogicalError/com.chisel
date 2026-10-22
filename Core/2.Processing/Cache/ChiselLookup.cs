@@ -32,6 +32,8 @@ namespace Chisel.Core
             public NativeList<BlobAssetReference<ExactBrush>>                   exactBrushCache;
 
             public NativeList<ChiselDecalInstance>                              decalInstances;
+            // where each decal was in the list SetDecals was given (ChiselDecalStore)
+            public NativeList<int>                                              decalSequences;
             public NativeList<MinMaxAABB>                                       decalBounds;
             public NativeList<ChiselDecalTarget>                                decalTargets;
             public NativeList<DecalVolume>                                      decalVolumes;
@@ -81,6 +83,7 @@ namespace Chisel.Core
 				exactBrushCache             = new NativeList<BlobAssetReference<ExactBrush>>(1000, Allocator.Persistent);
 
 				decalInstances              = new NativeList<ChiselDecalInstance>(16, Allocator.Persistent);
+				decalSequences              = new NativeList<int>(16, Allocator.Persistent);
 				decalBounds                 = new NativeList<MinMaxAABB>(16, Allocator.Persistent);
 				decalVolumes                = new NativeList<DecalVolume>(16, Allocator.Persistent);
 				hotspotLinks                = new NativeList<HotspotLink>(4, Allocator.Persistent);
@@ -257,6 +260,7 @@ namespace Chisel.Core
                 }
                 exactBrushCache = default;
                 if (decalInstances.IsCreated)     decalInstances.Dispose();
+                if (decalSequences.IsCreated)     decalSequences.Dispose();
                 if (decalBounds.IsCreated)        decalBounds.Dispose();
                 if (decalVolumes.IsCreated)       decalVolumes.Dispose();
                 if (decalTargets.IsCreated)       decalTargets.Dispose();
@@ -296,6 +300,7 @@ namespace Chisel.Core
                 if (renderMeshHashes.IsCreated) renderMeshHashes.Dispose();
                 renderMeshHashes = default;
                 decalInstances = default;
+                decalSequences = default;
                 decalBounds = default;
                 decalVolumes = default;
                 changedDecalBounds = default;

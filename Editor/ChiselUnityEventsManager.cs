@@ -111,6 +111,7 @@ namespace Chisel.Editors
 		private static void OnHierarchyChanged()
         {
             ChiselNodeHierarchyManager.CheckOrderOfChildNodesModifiedOfNonNodeGameObject();
+            ChiselDecalManager.HierarchyChanged();
         }
 
         private static void OnPickingChanged()

@@ -183,8 +183,9 @@ namespace Chisel.Core
     public static class CSGTreeDecalExtensions
     {
         /// <summary>
-        /// Replaces all decals of the tree at once. Pass every decal the tree should have, in any order. Only the
-        /// brushes near a decal that was added, removed, moved or changed are rebuilt, at the tree's next update.
+        /// Replaces all decals of the tree at once. Pass every decal the tree should have; decals of one
+        /// <see cref="ChiselDecalSettings.order"/> stack in the order they are given, the last on top. Only the brushes
+        /// near a decal that was added, removed, moved, changed or stacked otherwise are rebuilt, at the tree's next update.
         /// </summary>
         public static void SetDecals(this CSGTree tree, NativeArray<ChiselDecalInstance> decals)
         {

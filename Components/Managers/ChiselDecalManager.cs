@@ -14,6 +14,9 @@ namespace Chisel.Components
     public static class ChiselDecalManager
     {
         static readonly HashSet<ChiselDecalComponent> s_Decals = new();
+        // the decals in hierarchy order: how decals of one order stack (SetDecals), the same every time a scene is loaded
+        static readonly List<ChiselDecalComponent> s_Ordered = new();
+        static bool s_OrderDirty = true;
         // Last synchronized state for each model.
         static readonly Dictionary<ChiselModelComponent, ModelState> s_Models = new();
         static readonly List<ChiselModelComponent> s_ModelList = new();
@@ -45,14 +48,54 @@ namespace Chisel.Components
         public static void Register(ChiselDecalComponent decal)
         {
             if (decal != null && s_Decals.Add(decal))
-                s_Dirty = true;
+                s_Dirty = s_OrderDirty = true;
         }
 
         public static void Unregister(ChiselDecalComponent decal)
         {
             if (s_Decals.Remove(decal))
-                s_Dirty = true;
+                s_Dirty = s_OrderDirty = true;
+            // nothing keeps a removed decal (or its material) loaded
+            s_Ordered.Remove(decal);
             s_DecalStates.Remove(decal);
+        }
+
+        /// <summary>The hierarchy changed: the decals may be in another order.</summary>
+        public static void HierarchyChanged()
+        {
+            s_OrderDirty = true;
+        }
+
+        // Scene by scene, then by the sibling indices from the scene's root down
+        static void Order()
+        {
+            s_Ordered.Clear();
+            var keys = new List<(string scene, int[] path, ChiselDecalComponent decal)>(s_Decals.Count);
+            var path = new List<int>(16);
+            foreach (var decal in s_Decals)
+            {
+                if (decal == null)
+                    continue;
+                path.Clear();
+                for (var transform = decal.transform; transform != null; transform = transform.parent)
+                    path.Add(transform.GetSiblingIndex());
+                path.Reverse();
+                keys.Add((decal.gameObject.scene.path, path.ToArray(), decal));
+            }
+            keys.Sort((a, b) =>
+            {
+                var scene = string.CompareOrdinal(a.scene, b.scene);
+                if (scene != 0)
+                    return scene;
+                for (int i = 0; i < a.path.Length && i < b.path.Length; i++)
+                {
+                    if (a.path[i] != b.path[i])
+                        return a.path[i].CompareTo(b.path[i]);
+                }
+                return a.path.Length.CompareTo(b.path.Length);
+            });
+            foreach (var key in keys)
+                s_Ordered.Add(key.decal);
         }
 
         /// <summary>Makes the next update look at every decal again.</summary>
@@ -113,10 +156,16 @@ namespace Chisel.Components
                     state.targets.Clear();
                 }
 
+                if (s_Dirty || s_OrderDirty)
+                {
+                    Order();
+                    s_OrderDirty = false;
+                }
+
                 if (s_Dirty)
                 {
                     s_DecalStates.Clear();
-                    foreach (var decal in s_Decals)
+                    foreach (var decal in s_Ordered)
                     {
                         if (decal == null || decal.Material == null)
                             continue;
@@ -150,7 +199,7 @@ namespace Chisel.Components
                     }
                 }
 
-                foreach (var decal in s_Decals)
+                foreach (var decal in s_Ordered)
                 {
                     if (decal == null || !decal.isActiveAndEnabled ||
                         !s_DecalStates.TryGetValue(decal, out var decalState))

@@ -45,7 +45,7 @@ namespace Chisel.Core
 	}
 
 	// What a query's surfaces are grouped by: their parameter, and for a collider the chunk of space its brush is in
-	struct SurfaceGroupKey : IComparable<SurfaceGroupKey>
+	struct SurfaceGroupKey : IComparable<SurfaceGroupKey>, IEquatable<SurfaceGroupKey>
 	{
 		public ulong parameter;
 		public uint  chunk;
@@ -56,6 +56,7 @@ namespace Chisel.Core
 			return 0;
 		}
 		public bool Equals(SurfaceGroupKey other) => parameter == other.parameter && chunk == other.chunk;
+		public override int GetHashCode() => (int)math.hash(new uint3((uint)parameter, (uint)(parameter >> 32), chunk));
 	}
 
 	struct BrushData
@@ -611,8 +612,10 @@ namespace Chisel.Core
         }
     }
 
+    // Every query's surfaces grouped by key (SurfaceGroupKey): the groups in key order, brush order within a group. Brush
+    // by brush, so each brush's buffer is read once for all queries
     [BurstCompile(CompileSynchronously = true)]
-    struct PrepareSubSectionsJob : IJobParallelFor
+    struct PrepareSubSectionsJob : IJob
     {
         // Read
         [NoAlias, ReadOnly] public NativeArray<MeshQuery>   meshQueries;
@@ -620,109 +623,146 @@ namespace Chisel.Core
 
         // Read, Write
         public Allocator allocator;
-        [NativeDisableParallelForRestriction]
         [NoAlias] public NativeArray<UnsafeList<SubMeshSurface>> subMeshSurfaces;
 
-        public void Execute(int t)
+        struct QueryGroups
         {
-            int requiredSurfaceCount = 0;
-            for (int b = 0, count_b = brushRenderData.Length; b < count_b; b++)
-                requiredSurfaceCount += brushRenderData[b].brushSurfaceCount;
+            public UnsafeHashMap<SurfaceGroupKey, int> ids;
+            public UnsafeList<SurfaceGroupKey> keys;
+            // per group its surface count, then where its next surface goes
+            public UnsafeList<int> counts;
+            // per surface, in brush order, its group
+            public UnsafeList<int> groupOf;
+            public SurfaceGroupKey lastKey;
+            public int lastId, next;
+            public bool chunked;
+        }
 
-            // THIS IS THE SLOWDOWN
-            // TODO: store surface separately from brushes, *somehow* make lifetime work
-            //              => multiple arrays, one for each meshQuery!
-            //              => sorted by surface.layerParameters[meshQuery.layerParameterIndex]!
-            //              => this whole job could be removed
-            //
-            // TODO: store surface info and its vertices/indices separately, both sequentially in arrays
-            // TODO: store surface vertices/indices sequentially in a big array, *somehow* make ordering work
-
-            if (subMeshSurfaces[t].IsCreated)
+        public unsafe void Execute()
+        {
+            var queryCount = subMeshSurfaces.Length;
+            var queries = new NativeArray<QueryGroups>(queryCount, Allocator.Temp);
+            var anyChunked = false;
+            for (int t = 0; t < queryCount; t++)
             {
-                // should not happen
-                subMeshSurfaces[t].Dispose();
-                subMeshSurfaces[t] = default;
-            }
-
-            var subMeshSurfaceList = new UnsafeList<SubMeshSurface>(math.max(1, requiredSurfaceCount), allocator);
-
-            // A collider is a mesh per physics material and chunk, so a change rebakes only the chunks it touched
-            var chunked = meshQueries[t].LayerParameterIndex == SurfaceParameterIndex.PhysicsMaterial;
-            var brushChunks = new NativeArray<uint>(math.max(1, brushRenderData.Length), Allocator.Temp);
-            if (chunked)
-            {
-                for (int b = 0, count_b = brushRenderData.Length; b < count_b; b++)
-                    brushChunks[b] = ChunkOf(ref brushRenderData[b].brushRenderBuffer.Value);
-            }
-
-            // One key per surface of this query. Sorted, this both yields the distinct parameters and
-            // counts each group's surfaces, so the per-brush blobs are walked twice, not three times.
-            var parameters = new NativeList<SurfaceGroupKey>(math.max(1, requiredSurfaceCount), Allocator.Temp);
-            for (int b = 0, count_b = brushRenderData.Length; b < count_b; b++)
-            {
-                ref var surfaces = ref brushRenderData[b].brushRenderBuffer.Value.querySurfaces[t].surfaces;
-                for (int s = 0; s < surfaces.Length; s++)
-                    parameters.AddNoResize(new SurfaceGroupKey { parameter = surfaces[s].surfaceParameter, chunk = brushChunks[b] });
-            }
-            var surfaceCount = parameters.Length;
-            subMeshSurfaceList.Resize(surfaceCount, NativeArrayOptions.UninitializedMemory);
-            if (surfaceCount == 0)
-            {
-                parameters.Dispose();
-                brushChunks.Dispose();
-                subMeshSurfaces[t] = subMeshSurfaceList;
-                return;
-            }
-
-            parameters.Sort();
-
-            // Run-length encode the sorted keys into distinct parameters + the offset of each group
-            var groupOffsets = new NativeList<int>(surfaceCount + 1, Allocator.Temp);
-            int uniqueCount = 0;
-            for (int i = 0; i < surfaceCount; i++)
-            {
-                if (uniqueCount == 0 || !parameters[uniqueCount - 1].Equals(parameters[i]))
+                if (subMeshSurfaces[t].IsCreated)
                 {
-                    parameters[uniqueCount++] = parameters[i];
-                    groupOffsets.AddNoResize(i);
+                    // should not happen
+                    subMeshSurfaces[t].Dispose();
+                    subMeshSurfaces[t] = default;
+                }
+                // A collider is a mesh per physics material and chunk, so a change rebakes only the chunks it touched
+                var chunked = meshQueries[t].LayerParameterIndex == SurfaceParameterIndex.PhysicsMaterial;
+                anyChunked |= chunked;
+                queries[t] = new QueryGroups
+                {
+                    ids     = new UnsafeHashMap<SurfaceGroupKey, int>(16, Allocator.Temp),
+                    keys    = new UnsafeList<SurfaceGroupKey>(16, Allocator.Temp),
+                    counts  = new UnsafeList<int>(16, Allocator.Temp),
+                    groupOf = new UnsafeList<int>(64, Allocator.Temp),
+                    lastId  = -1,
+                    chunked = chunked
+                };
+            }
+            var groups = (QueryGroups*)queries.GetUnsafePtr();
+
+            var brushCount  = brushRenderData.Length;
+            var brushChunks = new NativeArray<uint>(math.max(1, brushCount), Allocator.Temp);
+            for (int b = 0; b < brushCount; b++)
+            {
+                ref var buffer = ref brushRenderData[b].brushRenderBuffer.Value;
+                var chunk = anyChunked ? ChunkOf(ref buffer) : 0;
+                brushChunks[b] = chunk;
+                ref var querySurfaces = ref buffer.querySurfaces;
+                for (int t = 0; t < queryCount; t++)
+                {
+                    ref var surfaces = ref querySurfaces[t].surfaces;
+                    if (surfaces.Length == 0)
+                        continue;
+                    ref var query = ref groups[t];
+                    var queryChunk = query.chunked ? chunk : 0;
+                    for (int s = 0; s < surfaces.Length; s++)
+                    {
+                        var key = new SurfaceGroupKey { parameter = surfaces[s].surfaceParameter, chunk = queryChunk };
+                        if (query.lastId < 0 || !key.Equals(query.lastKey))
+                        {
+                            if (!query.ids.TryGetValue(key, out query.lastId))
+                            {
+                                query.lastId = query.keys.Length;
+                                query.ids.Add(key, query.lastId);
+                                query.keys.Add(key);
+                                query.counts.Add(0);
+                            }
+                            query.lastKey = key;
+                        }
+                        query.counts[query.lastId]++;
+                        query.groupOf.Add(query.lastId);
+                    }
                 }
             }
-            parameters.Length = uniqueCount;
+
+            // where each group starts: only the distinct keys sorted
+            for (int t = 0; t < queryCount; t++)
+            {
+                ref var query = ref groups[t];
+                var list = new UnsafeList<SubMeshSurface>(math.max(1, query.groupOf.Length), allocator);
+                list.Resize(query.groupOf.Length, NativeArrayOptions.UninitializedMemory);
+                subMeshSurfaces[t] = list;
+                if (query.keys.Length == 0)
+                    continue;
+                var order = new NativeArray<int>(query.keys.Length, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
+                for (int g = 0; g < order.Length; g++)
+                    order[g] = g;
+                order.Sort(new ByGroupKey { keys = query.keys.Ptr });
+                for (int g = 0, offset = 0; g < order.Length; g++)
+                {
+                    var count = query.counts[order[g]];
+                    query.counts[order[g]] = offset;
+                    offset += count;
+                }
+                order.Dispose();
+            }
 
             // Scatter, keeping brush order within a group
-            for (int b = 0, count_b = brushRenderData.Length; b < count_b; b++)
+            for (int b = 0; b < brushCount; b++)
             {
-                var brushData         = brushRenderData[b];
-                var brushRenderBuffer = brushData.brushRenderBuffer;
-                ref var querySurfaces = ref brushRenderBuffer.Value.querySurfaces[t];
-                ref var brushNodeID   = ref querySurfaces.brushNodeID;
-				ref var surfaces      = ref querySurfaces.surfaces;
-
-                for (int s = 0; s < surfaces.Length; s++)
+                var brushRenderBuffer = brushRenderData[b].brushRenderBuffer;
+                ref var querySurfaces = ref brushRenderBuffer.Value.querySurfaces;
+                for (int t = 0; t < queryCount; t++)
                 {
-                    var group = FindGroup(parameters, new SurfaceGroupKey { parameter = surfaces[s].surfaceParameter, chunk = brushChunks[b] });
-                    var index = groupOffsets[group];
-                    groupOffsets[group] = index + 1;
-                    subMeshSurfaceList[index] = new SubMeshSurface
+                    ref var surfaces = ref querySurfaces[t].surfaces;
+                    if (surfaces.Length == 0)
+                        continue;
+                    ref var query = ref groups[t];
+                    var brushNodeID = querySurfaces[t].brushNodeID;
+                    var chunk = query.chunked ? brushChunks[b] : 0;
+                    var list = subMeshSurfaces[t];
+                    for (int s = 0; s < surfaces.Length; s++)
                     {
-                        brushNodeID       = brushNodeID,
-                        surfaceIndex      = surfaces[s].surfaceIndex,
-                        surfaceParameter  = surfaces[s].surfaceParameter,
-                        chunk             = brushChunks[b],
-                        vertexCount       = surfaces[s].vertexCount,
-                        indexCount        = surfaces[s].indexCount,
-                        surfaceHashValue  = surfaces[s].surfaceHashValue,
-                        geometryHashValue = surfaces[s].geometryHashValue,
-                        brushRenderBuffer = brushRenderBuffer,
-                    };
+                        var index = query.counts[query.groupOf[query.next++]]++;
+                        list[index] = new SubMeshSurface
+                        {
+                            brushNodeID       = brushNodeID,
+                            surfaceIndex      = surfaces[s].surfaceIndex,
+                            surfaceParameter  = surfaces[s].surfaceParameter,
+                            chunk             = chunk,
+                            vertexCount       = surfaces[s].vertexCount,
+                            indexCount        = surfaces[s].indexCount,
+                            surfaceHashValue  = surfaces[s].surfaceHashValue,
+                            geometryHashValue = surfaces[s].geometryHashValue,
+                            brushRenderBuffer = brushRenderBuffer,
+                        };
+                    }
                 }
             }
-            groupOffsets.Dispose();
-            parameters.Dispose();
-            brushChunks.Dispose();
 
-            subMeshSurfaces[t] = subMeshSurfaceList;
+            for (int t = 0; t < queryCount; t++)
+            {
+                ref var query = ref groups[t];
+                query.ids.Dispose(); query.keys.Dispose(); query.counts.Dispose(); query.groupOf.Dispose();
+            }
+            queries.Dispose();
+            brushChunks.Dispose();
         }
 
         const float kChunkSize = 16.0f;
@@ -746,16 +786,10 @@ namespace Chisel.Core
             return math.hash(cell);
         }
 
-        // Index of `value` in the sorted, distinct `parameters` (every value looked up came from it)
-        static int FindGroup(in NativeList<SurfaceGroupKey> parameters, SurfaceGroupKey value)
+        unsafe struct ByGroupKey : System.Collections.Generic.IComparer<int>
         {
-            int lo = 0, hi = parameters.Length - 1;
-            while (lo < hi)
-            {
-                var mid = (lo + hi) >> 1;
-                if (parameters[mid].CompareTo(value) < 0) lo = mid + 1; else hi = mid;
-            }
-            return lo;
+            [NativeDisableUnsafePtrRestriction] public SurfaceGroupKey* keys;
+            public readonly int Compare(int x, int y) => keys[x].CompareTo(keys[y]);
         }
     }
     

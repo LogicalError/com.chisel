@@ -2757,7 +2757,7 @@ namespace Chisel.Core
                         allocator       = defaultAllocator,
                         subMeshSurfaces = Temporaries.subMeshSurfaces,
                     };
-                    prepareSubSectionsJob.Schedule(runInParallel, Temporaries.meshQueriesLength, 1,
+                    prepareSubSectionsJob.Schedule(runInParallel,
                         JobHandles.Read(
                             JobHandleType.meshQueriesJobHandle,
                             JobHandleType.brushRenderDataJobHandle),

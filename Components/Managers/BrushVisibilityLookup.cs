@@ -4,7 +4,9 @@ using System.Collections.Generic;
 using Chisel.Core;
 
 using UnityEngine;
+using Unity.Burst;
 using Unity.Collections;
+using Unity.Jobs;
 
 #if UNITY_EDITOR
 using UnityEditor;
@@ -45,6 +47,43 @@ namespace Chisel.Components
 		public bool IsBrushVisible(CompactNodeID brushID) 
         { 
             return compactNodeIDVisibilityStateLookup.TryGetValue(brushID, out VisibilityState state) && state == VisibilityState.AllVisible;
+		}
+
+		// Whether the brush of every description is visible (IsBrushVisible), under Burst
+		public bool AllBrushesVisible(SelectionDescription[] descriptions)
+		{
+			if (descriptions == null || descriptions.Length == 0 || !compactNodeIDVisibilityStateLookup.IsCreated)
+				return false;
+			using var copy   = new NativeArray<SelectionDescription>(descriptions, Allocator.TempJob);
+			using var result = new NativeReference<bool>(Allocator.TempJob);
+			new AllBrushesVisibleJob { descriptions = copy, states = compactNodeIDVisibilityStateLookup, result = result }.Run();
+			return result.Value;
+		}
+
+		[BurstCompile]
+		struct AllBrushesVisibleJob : IJob
+		{
+			[ReadOnly] public NativeArray<SelectionDescription> descriptions;
+			[ReadOnly] public NativeHashMap<CompactNodeID, VisibilityState> states;
+			public NativeReference<bool> result;
+
+			public void Execute()
+			{
+				var last = CompactNodeID.Invalid;
+				for (int i = 0; i < descriptions.Length; i++)
+				{
+					var brush = descriptions[i].brushNodeID;
+					if (i > 0 && brush == last)
+						continue;
+					if (!states.TryGetValue(brush, out var state) || state != VisibilityState.AllVisible)
+					{
+						result.Value = false;
+						return;
+					}
+					last = brush;
+				}
+				result.Value = true;
+			}
 		}
 
 		[GenerateTestsForBurstCompatibility]

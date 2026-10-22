@@ -900,20 +900,7 @@ namespace Chisel.Components
 
         bool AllBrushesVisible(BrushVisibilityLookup visibilityLookup)
         {
-            var descriptions = triangleBrushes.selectionIndexDescriptions;
-            if (descriptions == null || descriptions.Length == 0)
-                return false;
-            var last = CompactNodeID.Invalid;
-            for (int i = 0; i < descriptions.Length; i++)
-            {
-                var brush = descriptions[i].brushNodeID;
-                if (i > 0 && brush == last)
-                    continue;
-                if (!visibilityLookup.IsBrushVisible(brush))
-                    return false;
-                last = brush;
-            }
-            return true;
+            return visibilityLookup.AllBrushesVisible(triangleBrushes.selectionIndexDescriptions);
         }
 
 

@@ -561,7 +561,12 @@ namespace Chisel.Core
                 Temporaries.nodes                          = new NativeList<CompactNodeID>(defaultAllocator);
                 Temporaries.brushes                        = new NativeList<CompactNodeID>(defaultAllocator);
 
-                compactHierarchy.GetTreeNodes(Temporaries.nodes, Temporaries.brushes);
+                unsafe
+                {
+                    fixed (CompactHierarchy* hierarchy = &compactHierarchy)
+                    fixed (NativeList<CompactNodeID>* nodes = &Temporaries.nodes, brushes = &Temporaries.brushes)
+                        CompactHierarchyTreeNodes.Get(hierarchy, nodes, brushes);
+                }
                 var newBrushCount = Temporaries.brushes.Length;
                 this.brushCount   = newBrushCount;
 

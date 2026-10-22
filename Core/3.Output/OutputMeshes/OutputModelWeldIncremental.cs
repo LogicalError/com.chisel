@@ -108,6 +108,9 @@ namespace Chisel.Core
         public UnsafeList<int3x3> corners;
         public UnsafeList<bool>   needle;
         public UnsafeList<WeldEntry> entries;
+        // this update: the entries the scope forgot, and where the ones recorded again start (RecordIncremental)
+        public UnsafeList<WeldEntry> forgotten;
+        public int recordedFrom;
 
         public void FreeInput()
         {
@@ -115,7 +118,8 @@ namespace Chisel.Core
             if (corners.IsCreated)      corners.Dispose();
             if (needle.IsCreated)       needle.Dispose();
             if (entries.IsCreated)      entries.Dispose();
-            surfaceStart = default; corners = default; needle = default; entries = default;
+            if (forgotten.IsCreated)    forgotten.Dispose();
+            surfaceStart = default; corners = default; needle = default; entries = default; forgotten = default;
         }
     }
 
@@ -420,6 +424,12 @@ namespace Chisel.Core
                                                : SplitsInScope(ref memory, slot, entry.surface);
                     if (!gone)
                         entries[kept++] = entry;
+                    else
+                    {
+                        if (!brush.forgotten.IsCreated)
+                            brush.forgotten = new UnsafeList<WeldEntry>(entries.Length, Allocator.Persistent);
+                        brush.forgotten.Add(entry);
+                    }
                 }
                 entries.Resize(kept);
                 brush.entries = entries;
@@ -491,6 +501,8 @@ namespace Chisel.Core
             {
                 ref var brush = ref memory.brushes.ElementAt(i);
                 brush.live = brush.changed = brush.dirty = false;
+                if (brush.forgotten.IsCreated)
+                    brush.forgotten.Clear();
             }
             memory.slotOfBrush.ResizeUninitialized(brushes.Length);
             var lastOrder = -1;
@@ -675,6 +687,11 @@ namespace Chisel.Core
         public static void RecordIncremental(NativeList<BrushData> brushes, ref WeldMemory memory, ref WeldState state, NativeList<float3x2> moves)
         {
             var work = state.work;
+            for (int b = 0; b < brushes.Length; b++)
+            {
+                ref var brush = ref memory.brushes.ElementAt(memory.slotOfBrush[b]);
+                brush.recordedFrom = brush.entries.IsCreated ? brush.entries.Length : 0;
+            }
             for (int w = 0; w < work.Length; w++)
             {
                 var item = work[w];
@@ -734,6 +751,13 @@ namespace Chisel.Core
             // the brushes stored again, each from its buffer and entries (welding everything, what the weld made is that)
             if (state.scope.all.Value)
                 return;
+            // a brush whose input stayed and that the weld made the same of again keeps the buffer it has
+            for (int b = 0; b < brushes.Length; b++)
+            {
+                ref var brush = ref memory.brushes.ElementAt(memory.slotOfBrush[b]);
+                if (brush.dirty && !brush.changed && SameAgain(ref brush))
+                    brush.dirty = false;
+            }
             WeldState.FreeWork(state.work);
             state.work.Clear();
             state.workIndex.Clear();
@@ -768,6 +792,59 @@ namespace Chisel.Core
                     }
                 }
                 state.copies.Add(new WeldCopy { brush = b });
+            }
+        }
+
+        struct BySurfaceAndIndex : System.Collections.Generic.IComparer<WeldEntry>
+        {
+            public int Compare(WeldEntry x, WeldEntry y)
+            {
+                if (x.surface != y.surface) return x.surface.CompareTo(y.surface);
+                if (x.vertex != y.vertex)   return x.vertex.CompareTo(y.vertex);
+                return x.index.CompareTo(y.index);
+            }
+        }
+
+        // The entries recorded again are the ones the scope forgot: what Copy makes of them is the same
+        static unsafe bool SameAgain(ref WeldBrush brush)
+        {
+            var again = brush.entries.Length - brush.recordedFrom;
+            var forgot = brush.forgotten.IsCreated ? brush.forgotten.Length : 0;
+            if (again != forgot)
+                return false;
+            if (again == 0)
+                return true;
+            var a = new NativeArray<WeldEntry>(again, Allocator.Temp);
+            var f = new NativeArray<WeldEntry>(again, Allocator.Temp);
+            try
+            {
+                for (int i = 0; i < again; i++)
+                {
+                    a[i] = brush.entries[brush.recordedFrom + i];
+                    f[i] = brush.forgotten[i];
+                }
+                a.Sort(new BySurfaceAndIndex());
+                f.Sort(new BySurfaceAndIndex());
+                for (int i = 0; i < again; i++)
+                {
+                    var x = a[i]; var y = f[i];
+                    if (x.surface != y.surface || x.vertex != y.vertex || x.index != y.index)
+                        return false;
+                    if (x.vertex)
+                    {
+                        if (!math.all(math.asint(x.collider) == math.asint(y.collider)) ||
+                            UnsafeUtility.MemCmp(&x.select, &y.select, UnsafeUtility.SizeOf<SelectVertex>()) != 0 ||
+                            UnsafeUtility.MemCmp(&x.render, &y.render, UnsafeUtility.SizeOf<RenderVertex>()) != 0)
+                            return false;
+                    } else
+                    if (!math.all(x.corners == y.corners))
+                        return false;
+                }
+                return true;
+            }
+            finally
+            {
+                a.Dispose(); f.Dispose();
             }
         }
 

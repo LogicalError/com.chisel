@@ -2416,8 +2416,7 @@ namespace Chisel.Core
 						// Write
 						brushRenderBufferCache    = chiselLookupValues.brushRenderBufferCache
                     };
-                    var currentJobHandle = generateSurfaceTrianglesJob.Schedule(runInParallel, Temporaries.allUpdateBrushIndexOrders, 1,
-                        JobHandles.Read(
+                    var readHandles = JobHandles.Read(
                             JobHandleType.brushTreeSpacePlaneCacheJobHandle,
                             JobHandleType.allUpdateBrushIndexOrdersJobHandle,
                             JobHandleType.basePolygonCacheJobHandle,
@@ -2427,8 +2426,11 @@ namespace Chisel.Core
                             JobHandleType.dataStream2JobHandle,
                             JobHandleType.meshQueriesJobHandle,
                             JobHandleType.decalVolumesJobHandle,
-                            JobHandleType.compactHierarchyJobHandle),   // entityIDLookup reads every hierarchy
-                        JobHandles.Write(JobHandleType.brushRenderBufferCacheJobHandle));
+                            JobHandleType.compactHierarchyJobHandle);   // entityIDLookup reads every hierarchy
+                    var writeHandles = JobHandles.Write(JobHandleType.brushRenderBufferCacheJobHandle);
+                    var currentJobHandle = exactCSG
+                        ? new GenerateExactSurfaceTrianglesJob { job = generateSurfaceTrianglesJob }.Schedule(runInParallel, Temporaries.allUpdateBrushIndexOrders, 1, readHandles, writeHandles)
+                        : generateSurfaceTrianglesJob.Schedule(runInParallel, Temporaries.allUpdateBrushIndexOrders, 1, readHandles, writeHandles);
 
 					NativeCollection.ScheduleDispose(runInParallel, ref dataStream2, currentJobHandle);
                 }

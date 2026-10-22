@@ -11,6 +11,16 @@ using andywiecko.BurstTriangulator;
 
 namespace Chisel.Core
 {
+	// GenerateSurfaceTrianglesJob for the exact CSG's input (triangles already made), Burst compiled: the FIXME below is
+	// about the loops' triangulation, which this does not run
+	[BurstCompile(FloatPrecision.High, FloatMode.Strict, CompileSynchronously = true)]
+	struct GenerateExactSurfaceTrianglesJob : IJobParallelForDefer
+	{
+		public GenerateSurfaceTrianglesJob job;
+
+		public void Execute(int index) => job.ExecuteExact(index);
+	}
+
 	//[BurstCompile(CompileSynchronously = true)] // FIXME: If enabled, it causes more missing triangles in the mesh
 	struct GenerateSurfaceTrianglesJob : IJobParallelForDefer
 	{
@@ -1075,7 +1085,7 @@ namespace Chisel.Core
 				finalFaceNormal = -finalFaceNormal;   // lighting for the "inside"
 		}
 
-		unsafe void ExecuteExact(int index)
+		internal unsafe void ExecuteExact(int index)
 		{
 			var count = input.BeginForEachIndex(index);
 			if (count == 0)

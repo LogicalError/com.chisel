@@ -324,6 +324,7 @@ namespace Chisel.Core
                 public NativeList<ChiselMeshUpdate>         meshUpdatesRenderables;
                 public NativeList<ChiselMeshUpdate>         meshUpdatesKept;
                 public NativeList<ChiselMeshUpdate>         meshUpdatesKeptColliders;
+                public NativeList<ChiselMeshUpdate>         meshUpdatesKeptDebugVisualizations;
                 public NativeArray<bool>                    keptSections;
                 public NativeArray<uint>                    sectionLightmapHashes;
                 public NativeList<ChiselMeshUpdate>         meshUpdatesDebugVisualizations;
@@ -661,6 +662,7 @@ namespace Chisel.Core
                 Temporaries.meshUpdatesRenderables          = new NativeList<ChiselMeshUpdate>(defaultAllocator);
                 Temporaries.meshUpdatesKept                 = new NativeList<ChiselMeshUpdate>(defaultAllocator);
                 Temporaries.meshUpdatesKeptColliders        = new NativeList<ChiselMeshUpdate>(defaultAllocator);
+                Temporaries.meshUpdatesKeptDebugVisualizations = new NativeList<ChiselMeshUpdate>(defaultAllocator);
                 Temporaries.meshUpdatesDebugVisualizations  = new NativeList<ChiselMeshUpdate>(defaultAllocator);
                 Temporaries.renderCopyRanges                = new NativeList<RenderCopyRange>(defaultAllocator);
                 Temporaries.renderCopyChunks                = new NativeList<int2>(defaultAllocator);
@@ -1007,7 +1009,8 @@ namespace Chisel.Core
 									    meshUpdatesRenderables          = treeUpdate.Temporaries.meshUpdatesRenderables,
 									    meshUpdatesDebugVisualizations  = treeUpdate.Temporaries.meshUpdatesDebugVisualizations,
 									    meshUpdatesKept                 = treeUpdate.Temporaries.meshUpdatesKept,
-									    meshUpdatesKeptColliders        = treeUpdate.Temporaries.meshUpdatesKeptColliders
+									    meshUpdatesKeptColliders        = treeUpdate.Temporaries.meshUpdatesKeptColliders,
+									    meshUpdatesKeptDebugVisualizations = treeUpdate.Temporaries.meshUpdatesKeptDebugVisualizations
                                     };
 								    var usedMeshCount = finishMeshUpdates(treeUpdate.tree, meshUpdates, treeUpdate.dependencies);
                                     treeUpdate.Temporaries.meshDataArray = default;
@@ -2854,8 +2857,7 @@ namespace Chisel.Core
 
             // Marks the sections whose mesh is made from the same as last time (Temporaries.keptSections), remembers what each
             // was made from, and gives each render mesh the hash of what its lightmap layout is made from
-            // (Temporaries.sectionLightmapHashes); returns how many are kept. A query's own material meshes and the colliders
-            // are kept; the shadow-only and debug meshes are always made again.
+            // (Temporaries.sectionLightmapHashes); returns how many are kept (FindKeptSectionHashesJob says which).
             int FindKeptSections(NativeParallelHashMap<RenderMeshKey, uint4> hashes)
             {
                 var sections = Temporaries.vertexBufferContents.subMeshSections;
@@ -2871,6 +2873,7 @@ namespace Chisel.Core
                     subMeshSurfaces       = Temporaries.subMeshSurfaces,
                     lightmapUVSettings    = lightmapUVSettings,
                     keeping               = hashes.IsCreated,
+                    debugVisualizations   = DebugVisualizations,
                     sectionLightmapHashes = Temporaries.sectionLightmapHashes,
                     sectionHashes         = sectionHashes,
                     hashed                = hashed
@@ -2946,6 +2949,7 @@ namespace Chisel.Core
 						meshUpdatesDebugVisualization = Temporaries.meshUpdatesDebugVisualizations,
 						meshUpdatesKept               = Temporaries.meshUpdatesKept,
 						meshUpdatesKeptColliders      = Temporaries.meshUpdatesKeptColliders,
+						meshUpdatesKeptDebugVisualization = Temporaries.meshUpdatesKeptDebugVisualizations,
                     };
                     assignMeshesJob.Schedule(runInParallel,
                         JobHandles.Read(
@@ -3438,6 +3442,7 @@ namespace Chisel.Core
                 lastJobHandle.AddDependency(Temporaries.meshUpdatesRenderables  .SafeDispose(JobHandles[JobHandleType.renderMeshesJobHandle].readWriteBarrier));
                 lastJobHandle.AddDependency(Temporaries.meshUpdatesKept         .SafeDispose(JobHandles[JobHandleType.renderMeshesJobHandle].readWriteBarrier));
                 lastJobHandle.AddDependency(Temporaries.meshUpdatesKeptColliders.SafeDispose(JobHandles[JobHandleType.renderMeshesJobHandle].readWriteBarrier));
+                lastJobHandle.AddDependency(Temporaries.meshUpdatesKeptDebugVisualizations.SafeDispose(JobHandles[JobHandleType.debugHelperMeshesJobHandle].readWriteBarrier));
                 if (Temporaries.keptSections.IsCreated)
                     lastJobHandle.AddDependency(Temporaries.keptSections        .SafeDispose(JobHandles[JobHandleType.renderMeshesJobHandle].readWriteBarrier));
                 if (Temporaries.sectionLightmapHashes.IsCreated)

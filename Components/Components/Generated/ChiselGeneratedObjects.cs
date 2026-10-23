@@ -136,14 +136,9 @@ namespace Chisel.Components
             var renderables   = Array.Empty<ChiselRenderObjects>();
             var meshRenderers = Array.Empty<MeshRenderer>();
 
-            var debugVisualizationRenderables = new ChiselRenderObjects[kVisualizationModeCount];
-            var debugMeshRenderers = new MeshRenderer[kVisualizationModeCount];
-            for (int i = 0; i < kVisualizationModeCount; i++)
-            {
-                debugVisualizationRenderables[i] = ChiselRenderObjects.Create(kGeneratedVisualizationRendererNames[i], containerTransform, gameObjectState, AssignMeshesJob.kGeneratedDebugRendererFlags[i].Item1, debugVisualizationRenderer: true);
-                debugMeshRenderers[i] = debugVisualizationRenderables[i].meshRenderer;
-                debugVisualizationRenderables[i].invalid = false;
-            }
+            // and the debug visualizations with the chunks they are shown in (FindDebugRenderables)
+            var debugVisualizationRenderables = Array.Empty<ChiselRenderObjects>();
+            var debugMeshRenderers = Array.Empty<MeshRenderer>();
 
             var result = new ChiselGeneratedObjects
             {
@@ -270,20 +265,8 @@ namespace Chisel.Components
                 return false;
 
             if (debugVisualizationRenderables == null ||
-                debugVisualizationRenderables.Length != kVisualizationModeCount ||
-                debugMeshRenderers == null ||
-                debugMeshRenderers.Length != kVisualizationModeCount)
+                debugMeshRenderers == null)
                 return false;
-
-            // These queries are valid, and should never be null (We don't care about the other queries)
-            for (int i = 0; i < kVisualizationModeCount;i++)
-            { 
-                if (debugVisualizationRenderables[i] == null)
-                    return false;
-            }
-            
-            for (int i = 0; i < kVisualizationModeCount; i++)
-                debugVisualizationRenderables[i].invalid = false;
 
             for (int i = 0; i < renderables.Length; i++)
             {
@@ -505,6 +488,71 @@ namespace Chisel.Components
             }
         }
 
+        // The same for the debug visualizations, by mode and chunk: a mode no draw mode shows has none
+        void FindDebugRenderables(ChiselModelComponent model, GameObjectState gameObjectState, ref ChiselMeshUpdates meshUpdates)
+        {
+            var existing = DictionaryPool<(int, uint), ChiselRenderObjects>.Get();
+            try
+            {
+                if (debugVisualizationRenderables != null)
+                {
+                    foreach (var renderable in debugVisualizationRenderables)
+                    {
+                        if (renderable == null || renderable.invalid || !renderable.IsValid() ||
+                            renderable.debugMode < 0 || renderable.debugMode >= kVisualizationModeCount ||
+                            !existing.TryAdd((renderable.debugMode, renderable.chunk), renderable))
+                            renderable?.Destroy();
+                    }
+                }
+                var containerTransform = generatedDataContainer.transform;
+                var updates   = meshUpdates.meshUpdatesDebugVisualizations;
+                var keptCount = meshUpdates.meshUpdatesKeptDebugVisualizations.IsCreated ? meshUpdates.meshUpdatesKeptDebugVisualizations.Length : 0;
+                var found     = new ChiselRenderObjects[updates.Length + keptCount];
+                var missing   = false;
+                for (int k = 0; k < keptCount; k++)
+                {
+                    var kept = meshUpdates.meshUpdatesKeptDebugVisualizations[k];
+                    if (!existing.Remove(((int)kept.objectIndex, kept.chunk), out var renderable) || !renderable.HasGeometry)
+                    {
+                        missing = true;
+                        renderable?.Destroy();
+                        renderable = null;
+                    }
+                    found[updates.Length + k] = renderable;
+                }
+                for (int i = 0; i < updates.Length; i++)
+                {
+                    var update = updates[i];
+                    var mode   = (int)update.objectIndex;
+                    if (!existing.Remove((mode, update.chunk), out var renderable))
+                    {
+                        renderable = ChiselRenderObjects.Create(kGeneratedVisualizationRendererNames[mode], containerTransform, gameObjectState,
+                                                                AssignMeshesJob.kGeneratedDebugRendererFlags[mode].Item1, debugVisualizationRenderer: true);
+                        renderable.debugMode = mode;
+                        renderable.chunk     = update.chunk;
+                    }
+                    found[i] = renderable;
+                    update.objectIndex = (ulong)i;
+                    updates[i] = update;
+                }
+                foreach (var unused in existing.Values)
+                    unused.Destroy();
+                if (missing)
+                {
+                    found = Array.FindAll(found, renderable => renderable != null);
+                    ChiselNodeHierarchyManager.RebuildTreeNodes(model);
+                }
+                debugVisualizationRenderables = found;
+                debugMeshRenderers = new MeshRenderer[found.Length];
+                for (int i = 0; i < found.Length; i++)
+                    debugMeshRenderers[i] = found[i].meshRenderer;
+            }
+            finally
+            {
+                DictionaryPool<(int, uint), ChiselRenderObjects>.Release(existing);
+            }
+        }
+
         static string RendererName(int index, ulong surfaceParameter)
         {
             var name = (index >= 0 && index < kGeneratedMeshRendererNames.Length ? kGeneratedMeshRendererNames[index] : null) ?? "‹[generated]›";
@@ -526,7 +574,6 @@ namespace Chisel.Components
 			var renderObjectUpdates = ListPool<ChiselRenderObjectUpdate>.Get();
 			var colliderObjects = ListPool<ChiselColliderObjects>.Get();
 			var foundMeshes = ListPool<Mesh>.Get();
-			var usedDebugVisualizations = HashSetPool<int>.Get();
 			var usedRenderMeshes = HashSetPool<int>.Get();
 			try
 			{
@@ -545,6 +592,7 @@ namespace Chisel.Components
 
                 Profiler.BeginSample("FindRenderables");
                 FindRenderables(model, gameObjectState, ref meshUpdates);
+                FindDebugRenderables(model, gameObjectState, ref meshUpdates);
                 Profiler.EndSample();
 
                 Debug.Assert(!meshUpdates.vertexBufferContents.meshDescriptions.IsCreated ||
@@ -572,16 +620,14 @@ namespace Chisel.Components
 
                 // Now do all kinds of book-keeping code that we might as well do while our jobs are running on other threads
                 Profiler.BeginSample("new_ChiselDebugObjectUpdate");
-                usedDebugVisualizations.Clear();
                 for (int i = 0; i < meshUpdates.meshUpdatesDebugVisualizations.Length; i++)
                 {
                     var debugVisualizationMeshUpdate = meshUpdates.meshUpdatesDebugVisualizations[i];
-                    usedDebugVisualizations.Add((int)debugVisualizationMeshUpdate.objectIndex);
                     var instance = debugVisualizationRenderables[debugVisualizationMeshUpdate.objectIndex];
                     renderObjectUpdates.Add(new ChiselRenderObjectUpdate
                     {
                         meshIndex         = debugVisualizationMeshUpdate.meshIndex,
-						materialOverride  = ChiselProjectSettings.DebugVisualizationMaterials[debugVisualizationMeshUpdate.objectIndex],
+						materialOverride  = ChiselProjectSettings.DebugVisualizationMaterials[instance.debugMode],
                         instance          = instance,
                         model             = model
                     });
@@ -717,30 +763,6 @@ namespace Chisel.Components
 
                     int meshDataArrayOffset = foundMeshes.Count;
 
-                    for (int i = 0; i < debugVisualizationRenderables.Length; i++)
-                    {
-                        if (usedDebugVisualizations.Contains(i))
-                            continue;
-
-                        var instance = debugVisualizationRenderables[i];
-                        if (instance.meshRenderer &&
-                            instance.meshRenderer.enabled)
-                            instance.meshRenderer.enabled = false;
-                        if (foundMeshes.Count < meshUpdates.meshDataArray.Length)
-                        {
-                            var sharedMesh = instance.sharedMesh;
-                            if (!sharedMesh || foundMeshes.Contains(sharedMesh))
-                                continue;
-
-                            foundMeshes.Add(sharedMesh);
-                            var emptyMeshData = meshUpdates.meshDataArray[meshDataArrayOffset];
-                            emptyMeshData.SetIndexBufferParams(0, IndexFormat.UInt32);
-                            emptyMeshData.SetVertexBufferParams(0, VertexBufferContents.RenderDescriptors);
-                            emptyMeshData.subMeshCount = 0;
-                            meshDataArrayOffset++;
-                        }
-                    }
-
                     // the mesh data allocated for materials no renderer drew this time
                     for (int pad = 0; foundMeshes.Count < meshUpdates.meshDataArray.Length; pad++)
                     {
@@ -815,7 +837,6 @@ namespace Chisel.Components
 				ListPool<ChiselRenderObjectUpdate>.Release(renderObjectUpdates);
 				ListPool<ChiselColliderObjects>.Release(colliderObjects);
 				ListPool<Mesh>.Release(foundMeshes);
-				HashSetPool<int>.Release(usedDebugVisualizations);
 				HashSetPool<int>.Release(usedRenderMeshes);
 			}
         }
@@ -845,6 +866,12 @@ namespace Chisel.Components
             }
         }
 
+        static bool ShowsDebugMode(DrawModeFlags drawModeFlags, int debugMode)
+        {
+            return debugMode >= 0 && debugMode < kVisualizationModeCount &&
+                   (drawModeFlags & kGeneratedVisualizationShowFlags[debugMode]) != DrawModeFlags.None;
+        }
+
         public void UpdateDebugVisualizationState(in BrushVisibilityLookup brushVisibilityLookup, DrawModeFlags drawModeFlags, bool ignoreBrushVisibility = false)
         {
 			//if (!ignoreBrushVisibility)
@@ -869,8 +896,8 @@ namespace Chisel.Components
             {
                 for (int i = 0; i < debugVisualizationRenderables.Length; i++)
                 {
-                    var showState = (drawModeFlags & kGeneratedVisualizationShowFlags[i]) != DrawModeFlags.None;
-                    debugVisualizationRenderables[i].visible = showState;
+                    if (debugVisualizationRenderables[i] != null)
+                        debugVisualizationRenderables[i].visible = ShowsDebugMode(drawModeFlags, debugVisualizationRenderables[i].debugMode);
                 }
             }
 
@@ -904,12 +931,11 @@ namespace Chisel.Components
                 {
                     for (int i = 0; i < debugVisualizationRenderables.Length; i++)
                     {
-                        var show = (drawModeFlags & kGeneratedVisualizationShowFlags[i]) != DrawModeFlags.None;
                         var debugVisualizationRenderable = debugVisualizationRenderables[i];
                         if (debugVisualizationRenderable == null)
                             continue;
 
-                        debugVisualizationRenderable.UpdateVisibilityMesh(brushVisibilityLookup, show);
+                        debugVisualizationRenderable.UpdateVisibilityMesh(brushVisibilityLookup, ShowsDebugMode(drawModeFlags, debugVisualizationRenderable.debugMode));
                     }
                 }
             }

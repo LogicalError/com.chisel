@@ -42,6 +42,20 @@ namespace Chisel.Core
         public ulong surfaceParameter;
         public uint  chunk;
         public bool Equals(RenderMeshKey other) => query == other.query && surfaceParameter == other.surfaceParameter && chunk == other.chunk;
+
+        // a debug visualization's query can be a render or collider query too: it is told apart by this bit
+        const int kDebugVisualization = 1 << 30;
+
+        internal static RenderMeshKey Of(MeshQuery meshQuery, SubMeshDescriptions description)
+        {
+            var debug = meshQuery.LayerParameterIndex == SurfaceParameterIndex.None;
+            return new RenderMeshKey
+            {
+                query            = (int)meshQuery.LayerQuery | (debug ? kDebugVisualization : 0),
+                surfaceParameter = description.surfaceParameter,
+                chunk            = description.chunk
+            };
+        }
         public override int GetHashCode() => (int)Unity.Mathematics.math.hash(new Unity.Mathematics.uint4((uint)query, (uint)surfaceParameter, (uint)(surfaceParameter >> 32), chunk));
     }
 
@@ -79,6 +93,7 @@ namespace Chisel.Core
         [NoAlias] public NativeList<ChiselMeshUpdate> meshUpdatesDebugVisualization;
         [NoAlias] public NativeList<ChiselMeshUpdate> meshUpdatesKept;
         [NoAlias] public NativeList<ChiselMeshUpdate> meshUpdatesKeptColliders;
+        [NoAlias] public NativeList<ChiselMeshUpdate> meshUpdatesKeptDebugVisualization;
 
 
         // A debug visualization's query that debugVisualizations leaves out
@@ -132,11 +147,26 @@ namespace Chisel.Core
                         if ((debugVisualizations & (1 << debugVisualizationIndex)) == 0)
                             continue;
 
+                        var debugChunk = meshDescriptions[subMeshSection.startIndex].chunk;
+                        if (keptSections.IsCreated && i < keptSections.Length && keptSections[i])
+                        {
+                            meshUpdatesKeptDebugVisualization.Add(new ChiselMeshUpdate
+                            {
+                                contentsIndex  = i,
+                                meshIndex      = -1,
+                                objectIndex    = (ulong)debugVisualizationIndex,
+                                chunk          = debugChunk,
+                                type           = ChiselMeshType.DebugVisualization,
+                                subMeshSection = subMeshSection
+                            });
+                            continue;
+                        }
                         var meshUpdate = new ChiselMeshUpdate
                         {
                             contentsIndex  = i,
                             meshIndex      = meshIndex,
                             objectIndex    = (ulong)debugVisualizationIndex,
+                            chunk          = debugChunk,
                             type           = ChiselMeshType.DebugVisualization,
 							subMeshSection = subMeshSection
 						};

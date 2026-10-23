@@ -51,6 +51,8 @@ namespace Chisel.Components
         public ulong            surfaceParameter;
         // the chunk of space it draws (Documentation~/Design/Chunking.md)
         public uint             chunk;
+        // a debug visualization's mode (ChiselGeneratedObjects.kGeneratedVisualizationShowFlags); -1 when unknown
+        public int              debugMode = -1;
         public GameObject       container;
         public Mesh             sharedMesh;
         public bool             enabled = true;

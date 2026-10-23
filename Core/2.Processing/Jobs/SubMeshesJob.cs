@@ -235,9 +235,8 @@ namespace Chisel.Core
 
     // Marks the sections whose mesh is made from the same as last time (keptSections), remembers what each was made from,
     // and gives each render mesh the hash of what its lightmap layout is made from (sectionLightmapHashes); kept: how
-    // many are kept. A query's own material meshes and the colliders are kept; the shadow-only and debug meshes are
-    // always made again. Section by section, in parallel, what each is made from (sectionHashes, FindKeptSectionHashesJob),
-    // then FindKeptSectionsJob
+    // many are kept. Render, shadow-only, collider and shown debug visualization meshes are kept. Section by section, in
+    // parallel, what each is made from (sectionHashes, FindKeptSectionHashesJob), then FindKeptSectionsJob
     [BurstCompile(CompileSynchronously = true)]
     unsafe struct FindKeptSectionHashesJob : IJobParallelFor
     {
@@ -246,6 +245,8 @@ namespace Chisel.Core
         [NoAlias, ReadOnly] public NativeArray<UnsafeList<SubMeshSurface>>   subMeshSurfaces;
         public LightmapUVSettings lightmapUVSettings;
         public bool keeping;
+        // the debug visualizations made (AssignMeshesJob.debugVisualizations): one that isn't leaves no hash behind
+        public int debugVisualizations;
 
         [NoAlias] public NativeArray<uint>   sectionLightmapHashes;
         // what a section that can be kept is made from (hashed: true)
@@ -260,16 +261,18 @@ namespace Chisel.Core
                 var section  = sections[i];
                 var collider = section.meshQuery.LayerParameterIndex == SurfaceParameterIndex.PhysicsMaterial;
                 var render   = section.meshQuery.LayerParameterIndex == SurfaceParameterIndex.RenderMaterial;
+                var debug    = section.meshQuery.LayerParameterIndex == SurfaceParameterIndex.None;
                 if (render)
                     sectionLightmapHashes[i] = LightmapHash(section, ref buffer);
                 if (!keeping ||
-                    !(collider || GatherSurfacesJob.OneMeshPerMaterial(section.meshQuery) || PrepareSubSections.OneMaterial(section.meshQuery)) ||
-                    (render && section.endIndex - section.startIndex != 1))
+                    !(collider || debug || GatherSurfacesJob.OneMeshPerMaterial(section.meshQuery) || PrepareSubSections.OneMaterial(section.meshQuery)) ||
+                    ((render || debug) && section.endIndex - section.startIndex != 1) ||
+                    (debug && AssignMeshesJob.HiddenDebugVisualization(section.meshQuery, debugVisualizations)))
                     return;
                 // a collider's section is the one description it starts at
                 var description = descriptions[section.startIndex];
                 buffer.Reset();
-                if (render)
+                if (render || debug)
                 {
                     buffer.Add(description.geometryHashValue);
                     buffer.Add(description.surfaceHashValue);
@@ -344,7 +347,7 @@ namespace Chisel.Core
                 var section     = sections[i];
                 var description = descriptions[section.startIndex];
                 var hash = sectionHashes[i];
-                var key  = new RenderMeshKey { query = (int)section.meshQuery.LayerQuery, surfaceParameter = description.surfaceParameter, chunk = description.chunk };
+                var key  = RenderMeshKey.Of(section.meshQuery, description);
                 if (!seen.Add(key))
                     continue;
                 if (hashes.TryGetValue(key, out var last) && last.Equals(hash))
@@ -672,9 +675,11 @@ namespace Chisel.Core
         // (Documentation~/Design/Chunking.md)
         public const float kSurfaceChunkSize = 32.0f;
 
-        public static bool SurfaceChunked(MeshQuery query) => query.LayerParameterIndex == SurfaceParameterIndex.RenderMaterial;
+        public static bool SurfaceChunked(MeshQuery query) => query.LayerParameterIndex == SurfaceParameterIndex.RenderMaterial ||
+                                                              query.LayerParameterIndex == SurfaceParameterIndex.None;
 
-        // A query drawn with one material of its own (shadow-only): its surfaces' materials don't split its meshes
+        // A query drawn with one material of its own (shadow-only, a debug visualization): its surfaces' materials don't
+        // split its meshes
         public static bool OneMaterial(MeshQuery query) => SurfaceChunked(query) && !GatherSurfacesJob.OneMeshPerMaterial(query);
 
         public static uint CellOf(MinMaxAABB aabb)

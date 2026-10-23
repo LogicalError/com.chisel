@@ -20,6 +20,8 @@ namespace Chisel.Core
 		[ReadOnly] public NativeList<ChiselMeshUpdate>  meshUpdatesKept;
 		// The same for the colliders: they keep their mesh and their bake
 		[ReadOnly] public NativeList<ChiselMeshUpdate>  meshUpdatesKeptColliders;
+		// and for the debug visualizations
+		[ReadOnly] public NativeList<ChiselMeshUpdate>  meshUpdatesKeptDebugVisualizations;
         
 		public Mesh.MeshDataArray meshDataArray;
     }

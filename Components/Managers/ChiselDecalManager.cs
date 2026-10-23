@@ -20,16 +20,19 @@ namespace Chisel.Components
         // Last synchronized state for each model.
         static readonly Dictionary<ChiselModelComponent, ModelState> s_Models = new();
         static readonly List<ChiselModelComponent> s_ModelList = new();
+        static readonly HashSet<ChiselModelComponent> s_ModelSet = new();
         static readonly List<ChiselModelComponent> s_Stale = new();
         static readonly Dictionary<ulong, SurfaceDestinationFlags> s_MaterialFlags = new();
         // Cached until registration or material metadata changes.
         static readonly Dictionary<ChiselDecalComponent, DecalState> s_DecalStates = new();
         static bool s_Dirty = true;
 
-        struct DecalState
+        sealed class DecalState
         {
             public ChiselModelComponent    parentModel;
             public Transform               transform;
+            // transform.localToWorldMatrix at the last update
+            public Matrix4x4               localToWorld;
             public ulong                   entityID;
             public ulong                   renderMaterial;
             public SurfaceDestinationFlags destinationFlags;
@@ -118,10 +121,13 @@ namespace Chisel.Components
             Profiler.BeginSample("ChiselDecalManager.Update");
             try
             {
+                // only a moved decal or model goes unannounced: anything else sets s_Dirty
+                var changed = false;
                 s_ModelList.Clear();
+                s_ModelSet.Clear();
                 foreach (var model in ChiselModelManager.Instance.Models)
                 {
-                    if (model != null && model.isActiveAndEnabled && model.Node.Valid)
+                    if (model != null && model.isActiveAndEnabled && model.Node.Valid && s_ModelSet.Add(model))
                         s_ModelList.Add(model);
                 }
 
@@ -129,7 +135,7 @@ namespace Chisel.Components
                 s_Stale.Clear();
                 foreach (var pair in s_Models)
                 {
-                    if (pair.Key == null || !s_ModelList.Contains(pair.Key))
+                    if (pair.Key == null || !s_ModelSet.Contains(pair.Key))
                         s_Stale.Add(pair.Key);
                 }
                 foreach (var model in s_Stale)
@@ -155,15 +161,19 @@ namespace Chisel.Components
                         state.previous.Clear();
                         s_Dirty = true;
                     }
-                    state.worldToLocal = model.transform.worldToLocalMatrix;
-                    state.decals.Clear();
-                    state.targets.Clear();
+                    var worldToLocal = model.transform.worldToLocalMatrix;
+                    if (!worldToLocal.Equals(state.worldToLocal))
+                    {
+                        state.worldToLocal = worldToLocal;
+                        changed = true;
+                    }
                 }
 
                 if (s_Dirty || s_OrderDirty)
                 {
                     Order();
                     s_OrderDirty = false;
+                    changed = true;
                 }
 
                 if (s_Dirty)
@@ -202,6 +212,28 @@ namespace Chisel.Components
                             targets          = targets
                         };
                     }
+                }
+
+                foreach (var decalState in s_DecalStates.Values)
+                {
+                    if (decalState.transform == null)
+                        continue;
+                    var localToWorld = decalState.transform.localToWorldMatrix;
+                    if (!localToWorld.Equals(decalState.localToWorld))
+                    {
+                        decalState.localToWorld = localToWorld;
+                        changed = true;
+                    }
+                }
+
+                if (!changed && !s_Dirty)
+                    return;
+
+                foreach (var model in s_ModelList)
+                {
+                    var state = s_Models[model];
+                    state.decals.Clear();
+                    state.targets.Clear();
                 }
 
                 foreach (var decal in s_Ordered)
@@ -257,6 +289,7 @@ namespace Chisel.Components
             {
                 // Do not retain temporary model references between updates.
                 s_ModelList.Clear();
+                s_ModelSet.Clear();
                 s_Stale.Clear();
                 Profiler.EndSample();
             }
@@ -285,10 +318,10 @@ namespace Chisel.Components
             return true;
         }
 
-        static ChiselDecalInstance Describe(ChiselDecalComponent decal, in DecalState decalState, Matrix4x4 modelWorldToLocal)
+        static ChiselDecalInstance Describe(ChiselDecalComponent decal, DecalState decalState, Matrix4x4 modelWorldToLocal)
         {
             // The tree's space is the model's own space
-            var decalToTree = modelWorldToLocal * decalState.transform.localToWorldMatrix;
+            var decalToTree = modelWorldToLocal * decalState.localToWorld;
             return new ChiselDecalInstance
             {
                 entityID         = decalState.entityID,

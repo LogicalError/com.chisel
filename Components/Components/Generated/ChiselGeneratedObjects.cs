@@ -102,6 +102,11 @@ namespace Chisel.Components
 
         public VisibilityState         visibilityState          = VisibilityState.Unknown;
         public bool                    needVisibilityMeshUpdate = false;
+        // what UpdateDebugVisualizationState last saw; while nothing of it changes it has nothing to do
+        [NonSerialized] bool           visibilityStateKnown;
+        [NonSerialized] int            lastVisibilityVersion;
+        [NonSerialized] DrawModeFlags  lastDrawModeFlags;
+        [NonSerialized] bool           lastShowWhole;
 
         public Hash128                 inputHash;
 
@@ -309,6 +314,9 @@ namespace Chisel.Components
 
         [NonSerialized] GameObjectState lastAppliedState;
         [NonSerialized] bool hasAppliedState;
+        // the renderer settings FinishMeshUpdates last applied to every renderer
+        [NonSerialized] bool rendererPropertiesApplied;
+        [NonSerialized] (GameObject, Transform, MotionVectorGenerationMode, ReflectionProbeUsage, LightProbeUsage, bool, uint, ReceiveGI, bool, float, Material) lastRendererProperties;
 
         internal void UpdateContainersWhenModelStateChanged(ChiselModelComponent model)
         {
@@ -320,10 +328,12 @@ namespace Chisel.Components
             UpdateContainers(model.gameObject);
         }
 
-        GameObjectState UpdateContainers(GameObject modelGameObject)
+        GameObjectState UpdateContainers(GameObject modelGameObject, bool force = false)
         {
             var modelTransform  = modelGameObject.transform;
             var gameObjectState = GameObjectState.Create(modelGameObject);
+            // a renderable's container only changes with the model's state, or when its geometry comes or goes
+            var sameState       = !force && hasAppliedState && gameObjectState.SameAs(lastAppliedState);
             lastAppliedState    = gameObjectState;
             hasAppliedState     = true;
             ChiselObjectUtility.UpdateContainerFlags(generatedDataContainer, gameObjectState);
@@ -346,9 +356,13 @@ namespace Chisel.Components
                 // to light, and claiming otherwise makes Unity trace rays against an empty mesh (see HasGeometry)
                 bool isInBakedLight = renderables[i].HasGeometry &&
                                       (query & SurfaceDestinationFlags.ExcludedFromGlobalIllumination) == SurfaceDestinationFlags.None;
+                if (sameState && renderables[i].containerApplied && renderables[i].containerInBakedLight == isInBakedLight)
+                    continue;
                 var renderableContainer = renderables[i].container;
                 ChiselObjectUtility.UpdateContainerFlags(renderableContainer, gameObjectState, isRenderable: isRenderable, contributesGI: isInBakedLight);
                 ChiselObjectUtility.ResetTransform(renderableContainer.transform, requiredParent: containerTransform);
+                renderables[i].containerApplied      = true;
+                renderables[i].containerInBakedLight = isInBakedLight;
             }
 
             if (debugVisualizationRenderables != null)
@@ -367,7 +381,7 @@ namespace Chisel.Components
 
         internal void RestoreSkippedUpdate(ChiselModelComponent model)
         {
-            UpdateContainers(model.gameObject);
+            UpdateContainers(model.gameObject, force: true);
             for (int i = 0; i < renderables.Length; i++)
             {
                 if (renderables[i] == null || renderables[i].invalid)
@@ -740,7 +754,19 @@ namespace Chisel.Components
                 }
 
                 Profiler.BeginSample("UpdateMeshRenderers");
-                ChiselRenderObjects.UpdateProperties(model, this.meshRenderers);
+                // unchanged settings only go to the renderers that were updated
+                var rendererProperties = ChiselRenderObjects.PropertiesOf(model);
+                var rendererPropertiesChanged = !rendererPropertiesApplied || !rendererProperties.Equals(lastRendererProperties);
+#if UNITY_EDITOR
+                rendererPropertiesChanged |= model.RenderSettings.serializedObjectFieldsDirty;
+#endif
+                if (rendererPropertiesChanged)
+                {
+                    ChiselRenderObjects.UpdateProperties(model, this.meshRenderers);
+                    rendererPropertiesApplied = true;
+                    lastRendererProperties    = rendererProperties;
+                } else
+                    ChiselRenderObjects.UpdateProperties(model, renderObjectUpdates);
                 Profiler.EndSample();
 
                 // Updates the Unity Mesh-es that are used in our MeshRenderers and MeshColliders
@@ -819,7 +845,7 @@ namespace Chisel.Components
             }
         }
 
-        public void UpdateDebugVisualizationState(BrushVisibilityLookup brushVisibilityLookup, DrawModeFlags drawModeFlags, bool ignoreBrushVisibility = false)
+        public void UpdateDebugVisualizationState(in BrushVisibilityLookup brushVisibilityLookup, DrawModeFlags drawModeFlags, bool ignoreBrushVisibility = false)
         {
 			//if (!ignoreBrushVisibility)
 			ChiselUnityVisibilityManager.UpdateVisibility();
@@ -827,6 +853,17 @@ namespace Chisel.Components
             var showRenderables = (drawModeFlags & DrawModeFlags.HideRenderables) == DrawModeFlags.None;
             // the occlusion culling visualizer shows what occlusion culling sees: every mesh whole, hidden brushes too
             var showWhole = UnityEditor.StaticOcclusionCullingVisualization.showOcclusionCulling;
+
+            // with the same visibility and draw mode only the renderables whose meshes changed have anything to do
+            var unchanged = visibilityStateKnown &&
+                            lastVisibilityVersion == brushVisibilityLookup.Version &&
+                            lastDrawModeFlags == drawModeFlags && lastShowWhole == showWhole;
+            if (unchanged && !needVisibilityMeshUpdate)
+                return;
+            visibilityStateKnown  = true;
+            lastVisibilityVersion = brushVisibilityLookup.Version;
+            lastDrawModeFlags     = drawModeFlags;
+            lastShowWhole         = showWhole;
 
             if (debugVisualizationRenderables != null)
             {
@@ -846,7 +883,8 @@ namespace Chisel.Components
                 {
                     var renderable = renderables[i];
                     if (renderable == null ||
-                        renderable.invalid)
+                        renderable.invalid ||
+                        (unchanged && !renderable.partialMeshDirty))
                         continue;
 
                     renderable.UpdateVisibilityMesh(brushVisibilityLookup, showRenderables);

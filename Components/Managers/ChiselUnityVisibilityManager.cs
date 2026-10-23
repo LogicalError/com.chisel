@@ -93,7 +93,7 @@ namespace Chisel.Components
                 if (!model || !model.isActiveAndEnabled || model.generated == null)
                     continue;
 				Profiler.BeginSample("UpdateDebugVisualizationState");
-				model.generated.UpdateDebugVisualizationState(s_BrushVisibilityLookup, drawModeFlags, ignoreBrushVisibility);
+				model.generated.UpdateDebugVisualizationState(in s_BrushVisibilityLookup, drawModeFlags, ignoreBrushVisibility);
 				Profiler.EndSample();
 			}
             return drawModeFlags;

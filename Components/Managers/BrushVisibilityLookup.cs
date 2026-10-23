@@ -24,6 +24,9 @@ namespace Chisel.Components
 		// per-renderable partial meshes) can tell whether their cached result is still current.
 		public int Version { get; private set; }
 
+		// How many entries of compactNodeIDVisibilityStateLookup are not AllVisible
+		int notAllVisibleCount;
+
 		public void Dispose()
 		{
 			// Confirmed to be called
@@ -34,13 +37,24 @@ namespace Chisel.Components
 			if (entityIDVisibilityStateLookup.IsCreated)
 				entityIDVisibilityStateLookup.Dispose();
 			entityIDVisibilityStateLookup = default;
+			notAllVisibleCount = 0;
 		}
 
         internal void Clear()
 		{
 			compactNodeIDVisibilityStateLookup.Clear();
 			entityIDVisibilityStateLookup.Clear();
+			notAllVisibleCount = 0;
 			Version++;
+		}
+
+		void SetState(CompactNodeID compactNodeID, VisibilityState state)
+		{
+			if (compactNodeIDVisibilityStateLookup.TryGetValue(compactNodeID, out var previous) && previous != VisibilityState.AllVisible)
+				notAllVisibleCount--;
+			if (state != VisibilityState.AllVisible)
+				notAllVisibleCount++;
+			compactNodeIDVisibilityStateLookup[compactNodeID] = state;
 		}
 
         [GenerateTestsForBurstCompatibility]
@@ -54,6 +68,9 @@ namespace Chisel.Components
 		{
 			if (descriptions == null || descriptions.Length == 0 || !compactNodeIDVisibilityStateLookup.IsCreated)
 				return false;
+			// nothing is hidden: no need to look at the brushes
+			if (notAllVisibleCount == 0)
+				return true;
 			using var copy   = new NativeArray<SelectionDescription>(descriptions, Allocator.TempJob);
 			using var result = new NativeReference<bool>(Allocator.TempJob);
 			new AllBrushesVisibleJob { descriptions = copy, states = compactNodeIDVisibilityStateLookup, result = result }.Run();
@@ -172,8 +189,8 @@ namespace Chisel.Components
             var state = GetVisibilityState(sceneVisibilityManager, node);
 
             foreach (var childCompactNodeID in CompactHierarchyManager.GetAllChildren(compactNodeID))
-                compactNodeIDVisibilityStateLookup[childCompactNodeID] = state;
-            compactNodeIDVisibilityStateLookup[modelCompactNodeID] = state | prevState;
+                SetState(childCompactNodeID, state);
+            SetState(modelCompactNodeID, state | prevState);
 			entityIDVisibilityStateLookup[UnityEngine.EntityId.ToULong(node.GetEntityId())] = state | prevState;
 		}
 
@@ -186,6 +203,7 @@ namespace Chisel.Components
             EnsureCreated();
 			compactNodeIDVisibilityStateLookup.Clear();
 			entityIDVisibilityStateLookup.Clear();
+			notAllVisibleCount = 0;
 			Version++;
 
 			var sceneVisibilityManager = SceneVisibilityManager.instance;
@@ -207,7 +225,7 @@ namespace Chisel.Components
                 var modelCompactNodeID  = CompactHierarchyManager.GetCompactNodeID(modelNode);
                 if (!compactNodeIDVisibilityStateLookup.TryGetValue(modelCompactNodeID, out VisibilityState state))
                 {
-                    compactNodeIDVisibilityStateLookup[modelCompactNodeID] = VisibilityState.AllVisible;
+                    SetState(modelCompactNodeID, VisibilityState.AllVisible);
                     entityIDVisibilityStateLookup[UnityEngine.EntityId.ToULong(model.GetEntityId())] = VisibilityState.AllVisible;
 					model.generated.visibilityState = VisibilityState.AllVisible;
                     continue; 

@@ -54,6 +54,9 @@ namespace Chisel.Components
         public GameObject       container;
         public Mesh             sharedMesh;
         public bool             enabled = true;
+        // what ChiselGeneratedObjects.UpdateContainers last applied to the container
+        [System.NonSerialized] public bool containerApplied;
+        [System.NonSerialized] public bool containerInBakedLight;
 #if UNITY_EDITOR
         public Mesh             partialMesh;
         public int              selectionMeshHashcode = ~0;
@@ -334,8 +337,37 @@ namespace Chisel.Components
             Profiler.BeginSample("meshRenderers");
             var forceShadowOnlyMaterial = ChiselProjectSettings.ForceShadowOnlySurfacesMaterial;
             for (int i = 0; i < meshRenderers.Length; i++)
+                ApplyProperties(meshRenderers[i], renderSettings, forceShadowOnlyMaterial);
+            Profiler.EndSample();
+        }
+
+        // The settings UpdateProperties applies, to tell whether they changed since it last ran
+        public static (GameObject, Transform, MotionVectorGenerationMode, ReflectionProbeUsage, LightProbeUsage, bool, uint, ReceiveGI, bool, float, Material)
+            PropertiesOf(ChiselModelComponent model)
+        {
+            var s = model.RenderSettings;
+            return (s.lightProbeProxyVolumeOverride, s.probeAnchor, s.motionVectorGenerationMode, s.reflectionProbeUsage, s.lightProbeUsage,
+                    s.allowOcclusionWhenDynamic, s.renderingLayerMask, s.receiveGI, s.stitchLightmapSeams, s.scaleInLightmap,
+                    ChiselProjectSettings.ForceShadowOnlySurfacesMaterial);
+        }
+
+        /// <summary>UpdateProperties for the renderers of these updates only, when the settings are the same</summary>
+        public static void UpdateProperties(ChiselModelComponent model, List<ChiselRenderObjectUpdate> objectUpdates)
+        {
+            var renderSettings = model.RenderSettings;
+            var forceShadowOnlyMaterial = ChiselProjectSettings.ForceShadowOnlySurfacesMaterial;
+            for (int u = 0; u < objectUpdates.Count; u++)
             {
-                var meshRenderer = meshRenderers[i];
+                var instance = objectUpdates[u].instance;
+                if (instance == null || instance.debugVisualizationRenderer || !instance.meshRenderer)
+                    continue;
+                ApplyProperties(instance.meshRenderer, renderSettings, forceShadowOnlyMaterial);
+            }
+        }
+
+        static void ApplyProperties(MeshRenderer meshRenderer, ChiselGeneratedRenderSettings renderSettings, Material forceShadowOnlyMaterial)
+        {
+            {
                 // The shadow-only renderer draws with ForceShadowOnly, and with shadows On (see Initialize)
                 var isRenderable = meshRenderer.shadowCastingMode != ShadowCastingMode.ShadowsOnly &&
                                    (!forceShadowOnlyMaterial || meshRenderer.sharedMaterial != forceShadowOnlyMaterial);
@@ -352,7 +384,6 @@ namespace Chisel.Components
                 meshRenderer.receiveGI                      = renderSettings.receiveGI;
 #endif
             }
-            Profiler.EndSample();
         }
 
 #if false // not used?

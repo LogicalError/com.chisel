@@ -64,6 +64,8 @@ namespace Chisel.Components
         // every brush of the mesh is visible: the scene view draws the mesh itself, not a partial copy of it
         [System.NonSerialized] bool partialIsShared;
         public Mesh DrawnMesh => partialIsShared ? sharedMesh : partialMesh;
+        // every brush in its mesh is shown (UpdateVisibilityMesh)
+        public bool AllBrushesShown => partialIsShared;
         public Mesh             selectionMesh;
         [NonSerialized, HideInInspector]
         public bool             visible;
@@ -928,7 +930,7 @@ namespace Chisel.Components
             } else
 			{
                 // TODO: get rid of needing meshRenderer?
-				return meshRenderer && meshRenderer.enabled && meshRenderer.forceRenderingOff;
+				return meshRenderer && meshRenderer.enabled;
 			}
 		}
 
@@ -1038,7 +1040,7 @@ namespace Chisel.Components
 			{
 				if (renderable == null)
 					continue;
-				if (!renderable.IsEnabled())
+				if (!renderable.IsEnabled() || DrawsItself(renderable))
 					continue;
 				renderable.RenderMesh(renderable.DrawnMesh, materialPropertyBlock, matrix, layer, camera, hasLightmaps);
 			}
@@ -1053,10 +1055,17 @@ namespace Chisel.Components
 			{
                 if (renderable == null)
                     continue;
-				if (!renderable.IsEnabled())
+				if (!renderable.IsEnabled() || DrawsItself(renderable))
 					continue;
 				renderable.RenderMesh(renderable.sharedMesh, materialPropertyBlock, matrix, layer, camera, hasLightmaps);
 			}
+		}
+
+		// Unity draws it (UpdateDebugVisualizationState left its renderer on); a debug visualization is only ever drawn here
+		[MethodImpl(MethodImplOptions.AggressiveInlining)]
+		static bool DrawsItself(ChiselRenderObjects renderable)
+		{
+			return !renderable.debugVisualizationRenderer && !renderable.meshRenderer.forceRenderingOff;
 		}
         
 

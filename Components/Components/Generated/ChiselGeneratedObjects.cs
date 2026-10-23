@@ -824,21 +824,7 @@ namespace Chisel.Components
 			//if (!ignoreBrushVisibility)
 			ChiselUnityVisibilityManager.UpdateVisibility();
             
-            var shouldHideMesh  = true/* !ignoreBrushVisibility &&
-                                  visibilityState != VisibilityState.AllVisible &&
-                                  visibilityState != VisibilityState.Unknown*/;
-                                  
             var showRenderables = (drawModeFlags & DrawModeFlags.HideRenderables) == DrawModeFlags.None;
-            for (int i = 0; i < renderables.Length; i++)
-            {
-                var renderable = renderables[i];
-                if (renderable == null ||
-                    renderable.invalid)
-                    continue;
-
-                if (renderable.meshRenderer != null)
-                    renderable.meshRenderer.forceRenderingOff = shouldHideMesh || !showRenderables;
-            }
 
             if (debugVisualizationRenderables != null)
             {
@@ -862,6 +848,16 @@ namespace Chisel.Components
                         continue;
 
                     renderable.UpdateVisibilityMesh(brushVisibilityLookup, showRenderables);
+
+                    // A renderer whose brushes are all shown draws itself, so Unity culls it (occlusion culling, its
+                    // visualizer); otherwise it is drawn by OnRenderModel, through its copy without the hidden brushes
+                    if (renderable.meshRenderer == null)
+                        continue;
+                    var drawsItself = showRenderables && renderable.AllBrushesShown;
+                    if (renderable.meshRenderer.forceRenderingOff == drawsItself)
+                        renderable.meshRenderer.forceRenderingOff = !drawsItself;
+                    if (drawsItself)
+                        renderable.enabled = true;
                 }
 
                 if (debugVisualizationRenderables != null)

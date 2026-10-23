@@ -19,6 +19,8 @@ namespace Chisel.Core
         public float LightmapTexelsPerUnit;
         /// <summary>The lightmap texels between two charts (LightmapUVSettings.paddingTexels)</summary>
         public float LightmapPaddingTexels;
+        /// <summary>The largest lightmap a renderer may ask for, in texels; 0 when the model doesn't bake lightmaps</summary>
+        public int LightmapMaxSize;
     }
      
     public static class ModelSettingsStore
@@ -236,6 +238,8 @@ namespace Chisel.Core
             public bool          subtractiveWorkflow;
             public float         normalSmoothingAngle;
             public LightmapUVSettings lightmapUVSettings;
+            // the lightmap area a render chunk may have before it is split (PrepareSubSections.LightmapSplit); 0: never
+            public float         lightmapAreaBudget;
 
             public JobHandle     dependencies;
 
@@ -548,12 +552,18 @@ namespace Chisel.Core
                 subtractiveWorkflow = false;
                 normalSmoothingAngle = -1f; // -1 means no smoothing
                 lightmapUVSettings = LightmapUVSettings.Default;
+                lightmapAreaBudget = 0;
 
                 if (ModelSettingsStore.TryGet(UnityEngine.EntityId.ToULong(tree.EntityId), out var modelSettings))
                 {
                     subtractiveWorkflow = modelSettings.SubtractiveWorkflow;
                     normalSmoothingAngle = modelSettings.NormalSmoothing ? math.clamp(modelSettings.NormalSmoothingAngle, 0.0f, 180.0f) : 0.0f;
                     lightmapUVSettings = new LightmapUVSettings { texelsPerUnit = modelSettings.LightmapTexelsPerUnit, paddingTexels = modelSettings.LightmapPaddingTexels }.Usable;
+                    if (modelSettings.LightmapMaxSize > 0)
+                    {
+                        var side = modelSettings.LightmapMaxSize / lightmapUVSettings.texelsPerUnit;
+                        lightmapAreaBudget = side * side;
+                    }
                 }
 
                 ref var compactHierarchy = ref CompactHierarchyManager.GetHierarchy(this.treeCompactNodeID);
@@ -2765,7 +2775,8 @@ namespace Chisel.Core
                         brushRenderData = Temporaries.brushRenderData,
                         allocator       = defaultAllocator,
                         ranges          = ranges,
-                        rangeChunks     = rangeChunks
+                        rangeChunks     = rangeChunks,
+                        lightmapAreaBudget = lightmapAreaBudget
                     }.Schedule(runInParallel, PrepareSubSections.kRangeCount, 1,
                         JobHandles.Read(
                             JobHandleType.meshQueriesJobHandle,
@@ -2774,6 +2785,7 @@ namespace Chisel.Core
                     new PrepareSubSectionsJob
                     {
                         meshQueries     = Temporaries.meshQueries,
+                        lightmapAreaBudget = lightmapAreaBudget,
                         allocator       = defaultAllocator,
                         ranges          = ranges,
                         subMeshSurfaces = Temporaries.subMeshSurfaces,

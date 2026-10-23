@@ -661,6 +661,14 @@ namespace Chisel.Core
             public UnsafeList<SurfaceGroupKey> keys;
             public UnsafeList<int> counts;
             public UnsafeList<int> groupOf;
+            // A lightmap split query's keys are 8 m cells: each one's cell and lightmap area, and the group it goes to
+            // (finalOf, into finalKeys and finalCounts, from PrepareSubSectionsJob). Otherwise a key is its own group,
+            // and finalKeys and finalCounts are keys and counts.
+            public UnsafeList<int3>  cells;
+            public UnsafeList<float> areas;
+            public UnsafeList<int>   finalOf;
+            public UnsafeList<SurfaceGroupKey> finalKeys;
+            public UnsafeList<int>   finalCounts;
         }
 
         public static void Range(int range, int brushCount, out int first, out int end)
@@ -696,6 +704,45 @@ namespace Chisel.Core
                 parameter = oneMaterial ? 0 : surface.surfaceParameter,
                 chunk     = chunked ? brushChunk : surfaceChunked ? CellOf(buffer.surfaces[surface.surfaceIndex].aabb) : 0
             };
+        }
+
+        // A model that bakes lightmaps splits a render chunk whose lightmap would be larger than the lighting allows
+        // (lightmapAreaBudget, in square units) into its 16 m cells, and those into 8 m ones (Chunking.md)
+        public static bool LightmapSplit(MeshQuery query, float lightmapAreaBudget)
+        {
+            return lightmapAreaBudget > 0 && GatherSurfacesJob.OneMeshPerMaterial(query) &&
+                   (query.LayerQuery & SurfaceDestinationFlags.ExcludedFromGlobalIllumination) == 0;
+        }
+
+        const float kFineChunkSize = kSurfaceChunkSize / 4;
+
+        public static int3 FineCellOf(MinMaxAABB aabb)
+        {
+            return (int3)math.floor((aabb.Min + aabb.Max) * (0.5f / kFineChunkSize));
+        }
+
+        // The chunk of an 8 m cell's 32 m (level 0, the same as CellOf), 16 m (1) or 8 m (2) cell
+        public static uint ChunkOfCell(int3 fineCell, int level)
+        {
+            if (level == 0)
+                return math.hash(FloorDivide(fineCell, 4));
+            if (level == 1)
+                return math.hash(new int4(FloorDivide(fineCell, 2), 1));
+            return math.hash(new int4(fineCell, 2));
+        }
+
+        static int3 FloorDivide(int3 value, int divisor)
+        {
+            var quotient = value / divisor;
+            return quotient - math.select(int3.zero, new int3(1), (value % divisor != 0) & (value < 0));
+        }
+
+        // What a surface asks of the lightmap: its chart's rectangle
+        public static float LightmapArea(ref ChiselBrushRenderBuffer buffer, ChiselQuerySurface surface)
+        {
+            var chart = buffer.surfaces[surface.surfaceIndex].lightmapChart;
+            var size  = math.max(chart.zw - chart.xy, float2.zero);
+            return size.x * size.y;
         }
 
         const float kChunkSize = 16.0f;
@@ -740,6 +787,7 @@ namespace Chisel.Core
         [NativeDisableParallelForRestriction] [NoAlias] public NativeArray<PrepareSubSections.RangeGroups> ranges;
         // per range: its brushes' chunks
         [NativeDisableParallelForRestriction] [NoAlias] public NativeArray<UnsafeList<uint>> rangeChunks;
+        public float lightmapAreaBudget;
 
         public unsafe void Execute(int range)
         {
@@ -749,6 +797,7 @@ namespace Chisel.Core
             var chunked = stackalloc bool[queryCount];
             var surfaceChunked = stackalloc bool[queryCount];
             var oneMaterial    = stackalloc bool[queryCount];
+            var split          = stackalloc bool[queryCount];
             var ids     = stackalloc UnsafeHashMap<SurfaceGroupKey, int>[queryCount];
             var lastKey = stackalloc SurfaceGroupKey[queryCount];
             var lastId  = stackalloc int[queryCount];
@@ -757,6 +806,7 @@ namespace Chisel.Core
                 chunked[t] = PrepareSubSections.Chunked(meshQueries[t]);
                 surfaceChunked[t] = PrepareSubSections.SurfaceChunked(meshQueries[t]);
                 oneMaterial[t]    = PrepareSubSections.OneMaterial(meshQueries[t]);
+                split[t]          = PrepareSubSections.LightmapSplit(meshQueries[t], lightmapAreaBudget);
                 anyChunked |= chunked[t];
                 ids[t] = new UnsafeHashMap<SurfaceGroupKey, int>(16, Allocator.Temp);
                 lastId[t] = -1;
@@ -764,7 +814,9 @@ namespace Chisel.Core
                 {
                     keys    = new UnsafeList<SurfaceGroupKey>(16, allocator),
                     counts  = new UnsafeList<int>(16, allocator),
-                    groupOf = new UnsafeList<int>(64, allocator)
+                    groupOf = new UnsafeList<int>(64, allocator),
+                    cells   = split[t] ? new UnsafeList<int3>(16, allocator) : default,
+                    areas   = split[t] ? new UnsafeList<float>(16, allocator) : default
                 };
             }
             var groups = (PrepareSubSections.RangeGroups*)ranges.GetUnsafePtr() + range * queryCount;
@@ -783,7 +835,14 @@ namespace Chisel.Core
                     ref var query = ref groups[t];
                     for (int s = 0; s < surfaces.Length; s++)
                     {
-                        var key = PrepareSubSections.KeyOf(ref buffer, surfaces[s], chunk, chunked[t], surfaceChunked[t], oneMaterial[t]);
+                        SurfaceGroupKey key;
+                        var cell = int3.zero;
+                        if (split[t])
+                        {
+                            cell = PrepareSubSections.FineCellOf(buffer.surfaces[surfaces[s].surfaceIndex].aabb);
+                            key  = new SurfaceGroupKey { parameter = surfaces[s].surfaceParameter, chunk = PrepareSubSections.ChunkOfCell(cell, 2) };
+                        } else
+                            key = PrepareSubSections.KeyOf(ref buffer, surfaces[s], chunk, chunked[t], surfaceChunked[t], oneMaterial[t]);
                         if (lastId[t] < 0 || !key.Equals(lastKey[t]))
                         {
                             if (!ids[t].TryGetValue(key, out lastId[t]))
@@ -792,11 +851,18 @@ namespace Chisel.Core
                                 ids[t].Add(key, lastId[t]);
                                 query.keys.Add(key);
                                 query.counts.Add(0);
+                                if (split[t])
+                                {
+                                    query.cells.Add(cell);
+                                    query.areas.Add(0);
+                                }
                             }
                             lastKey[t] = key;
                         }
                         query.counts[lastId[t]]++;
                         query.groupOf.Add(lastId[t]);
+                        if (split[t])
+                            query.areas[lastId[t]] += PrepareSubSections.LightmapArea(ref buffer, surfaces[s]);
                     }
                 }
             }
@@ -813,6 +879,7 @@ namespace Chisel.Core
     {
         // Read
         [NoAlias, ReadOnly] public NativeArray<MeshQuery>   meshQueries;
+        public float lightmapAreaBudget;
 
         // Read, Write
         public Allocator allocator;
@@ -828,6 +895,18 @@ namespace Chisel.Core
                 subMeshSurfaces[t].Dispose();
                 subMeshSurfaces[t] = default;
             }
+            var parts = (PrepareSubSections.RangeGroups*)ranges.GetUnsafePtr();
+            if (PrepareSubSections.LightmapSplit(meshQueries[t], lightmapAreaBudget))
+                SplitForLightmaps(parts, queryCount, t);
+            else
+            {
+                for (int r = 0; r < PrepareSubSections.kRangeCount; r++)
+                {
+                    ref var part = ref parts[r * queryCount + t];
+                    part.finalKeys   = part.keys;
+                    part.finalCounts = part.counts;
+                }
+            }
             var ids        = new UnsafeHashMap<SurfaceGroupKey, int>(16, Allocator.Temp);
             var keys       = new UnsafeList<SurfaceGroupKey>(16, Allocator.Temp);
             var totals     = new UnsafeList<int>(16, Allocator.Temp);
@@ -835,17 +914,17 @@ namespace Chisel.Core
             var surfaceCount = 0;
             for (int r = 0; r < PrepareSubSections.kRangeCount; r++)
             {
-                var part = ranges[r * queryCount + t];
-                for (int l = 0; l < part.keys.Length; l++)
+                var part = parts[r * queryCount + t];
+                for (int l = 0; l < part.finalKeys.Length; l++)
                 {
-                    if (!ids.TryGetValue(part.keys[l], out var g))
+                    if (!ids.TryGetValue(part.finalKeys[l], out var g))
                     {
                         g = keys.Length;
-                        ids.Add(part.keys[l], g);
-                        keys.Add(part.keys[l]);
+                        ids.Add(part.finalKeys[l], g);
+                        keys.Add(part.finalKeys[l]);
                         totals.Add(0);
                     }
-                    totals[g] += part.counts[l];
+                    totals[g] += part.finalCounts[l];
                     globalOf.Add(g);
                 }
                 surfaceCount += part.groupOf.Length;
@@ -869,12 +948,12 @@ namespace Chisel.Core
                 // earlier ranges first: brush order within a group
                 for (int r = 0, i = 0; r < PrepareSubSections.kRangeCount; r++)
                 {
-                    ref var part = ref UnsafeUtility.ArrayElementAsRef<PrepareSubSections.RangeGroups>(ranges.GetUnsafePtr(), r * queryCount + t);
-                    for (int l = 0; l < part.keys.Length; l++, i++)
+                    ref var part = ref parts[r * queryCount + t];
+                    for (int l = 0; l < part.finalKeys.Length; l++, i++)
                     {
                         var g = globalOf[i];
-                        var count = part.counts[l];
-                        part.counts[l] = next[g];
+                        var count = part.finalCounts[l];
+                        part.finalCounts[l] = next[g];
                         next[g] += count;
                     }
                 }
@@ -882,6 +961,62 @@ namespace Chisel.Core
                 order.Dispose();
             }
             globalOf.Dispose(); totals.Dispose(); keys.Dispose(); ids.Dispose();
+        }
+
+        // Each 8 m key to its 32 m cell when that cell's lightmap fits, else its 16 m cell when that one fits, else its
+        // own; a cell with one surface fits. Depends only on what is in the cell, so an edit changes only its own cells.
+        unsafe void SplitForLightmaps(PrepareSubSections.RangeGroups* parts, int queryCount, int t)
+        {
+            // area and surface count of every 32 m and 16 m cell
+            var sums = new UnsafeHashMap<SurfaceGroupKey, float2>(64, Allocator.Temp);
+            for (int r = 0; r < PrepareSubSections.kRangeCount; r++)
+            {
+                ref var part = ref parts[r * queryCount + t];
+                for (int l = 0; l < part.keys.Length; l++)
+                {
+                    for (int level = 0; level < 2; level++)
+                    {
+                        var key = new SurfaceGroupKey { parameter = part.keys[l].parameter, chunk = PrepareSubSections.ChunkOfCell(part.cells[l], level) };
+                        sums.TryGetValue(key, out var sum);
+                        sums[key] = sum + new float2(part.areas[l], part.counts[l]);
+                    }
+                }
+            }
+            var local = new UnsafeHashMap<SurfaceGroupKey, int>(16, Allocator.Temp);
+            for (int r = 0; r < PrepareSubSections.kRangeCount; r++)
+            {
+                ref var part = ref parts[r * queryCount + t];
+                part.finalOf     = new UnsafeList<int>(math.max(1, part.keys.Length), allocator);
+                part.finalKeys   = new UnsafeList<SurfaceGroupKey>(math.max(1, part.keys.Length), allocator);
+                part.finalCounts = new UnsafeList<int>(math.max(1, part.keys.Length), allocator);
+                local.Clear();
+                for (int l = 0; l < part.keys.Length; l++)
+                {
+                    var level = 2;
+                    for (int coarse = 0; coarse < 2; coarse++)
+                    {
+                        var key = new SurfaceGroupKey { parameter = part.keys[l].parameter, chunk = PrepareSubSections.ChunkOfCell(part.cells[l], coarse) };
+                        var sum = sums[key];
+                        if (sum.x <= lightmapAreaBudget || sum.y <= 1)
+                        {
+                            level = coarse;
+                            break;
+                        }
+                    }
+                    var final = new SurfaceGroupKey { parameter = part.keys[l].parameter, chunk = PrepareSubSections.ChunkOfCell(part.cells[l], level) };
+                    if (!local.TryGetValue(final, out var f))
+                    {
+                        f = part.finalKeys.Length;
+                        local.Add(final, f);
+                        part.finalKeys.Add(final);
+                        part.finalCounts.Add(0);
+                    }
+                    part.finalCounts[f] += part.counts[l];
+                    part.finalOf.Add(f);
+                }
+            }
+            local.Dispose();
+            sums.Dispose();
         }
     }
 
@@ -904,17 +1039,9 @@ namespace Chisel.Core
             var queryCount = meshQueries.Length;
             PrepareSubSections.Range(range, brushRenderData.Length, out var first, out var end);
             var groups = (PrepareSubSections.RangeGroups*)ranges.GetUnsafePtr() + range * queryCount;
-            var chunked = stackalloc bool[queryCount];
-            var surfaceChunked = stackalloc bool[queryCount];
-            var oneMaterial    = stackalloc bool[queryCount];
             var next    = stackalloc int[queryCount];
             for (int t = 0; t < queryCount; t++)
-            {
-                chunked[t] = PrepareSubSections.Chunked(meshQueries[t]);
-                surfaceChunked[t] = PrepareSubSections.SurfaceChunked(meshQueries[t]);
-                oneMaterial[t]    = PrepareSubSections.OneMaterial(meshQueries[t]);
                 next[t] = 0;
-            }
             var chunks = rangeChunks[range];
             for (int b = first; b < end; b++)
             {
@@ -930,8 +1057,10 @@ namespace Chisel.Core
                     var list = subMeshSurfaces[t];
                     for (int s = 0; s < surfaces.Length; s++)
                     {
-                        var key   = PrepareSubSections.KeyOf(ref brushRenderBuffer.Value, surfaces[s], chunks[b - first], chunked[t], surfaceChunked[t], oneMaterial[t]);
-                        var index = query.counts[query.groupOf[next[t]++]]++;
+                        var localGroup = query.groupOf[next[t]++];
+                        var group = query.finalOf.IsCreated ? query.finalOf[localGroup] : localGroup;
+                        var key   = query.finalKeys[group];
+                        var index = query.finalCounts[group]++;
                         list[index] = new SubMeshSurface
                         {
                             brushNodeID       = brushNodeID,
@@ -950,6 +1079,14 @@ namespace Chisel.Core
             for (int t = 0; t < queryCount; t++)
             {
                 ref var query = ref groups[t];
+                if (query.finalOf.IsCreated)
+                {
+                    query.finalOf.Dispose(); query.finalKeys.Dispose(); query.finalCounts.Dispose();
+                }
+                if (query.cells.IsCreated)
+                {
+                    query.cells.Dispose(); query.areas.Dispose();
+                }
                 query.keys.Dispose(); query.counts.Dispose(); query.groupOf.Dispose();
             }
             chunks.Dispose();

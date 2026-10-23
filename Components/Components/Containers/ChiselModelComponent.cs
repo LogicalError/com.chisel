@@ -152,6 +152,8 @@ namespace Chisel.Components
         [HideInInspector] public float          lightmapTexelsPerUnit           = 0.0f;
         /// <summary>The texels between lightmap charts they were laid out with (uvGenerationSettings.packMarginPixels in the editor)</summary>
         [HideInInspector] public float          lightmapPaddingTexels           = 0.0f;
+        /// <summary>The largest lightmap a renderer may ask for, in texels, when the model bakes lightmaps; else 0 (no lightmap split)</summary>
+        [HideInInspector] public int            lightmapMaxSize                 = 0;
 
 #if UNITY_EDITOR
         // SerializedObject access Only
@@ -414,6 +416,7 @@ namespace Chisel.Components
             // The texels its lightmap coordinates are laid out for (ChiselLightmapUVManager)
             renderSettings.lightmapTexelsPerUnit = ChiselLightmapUVManager.LightmapResolution() * renderSettings.scaleInLightmap;
             renderSettings.lightmapPaddingTexels = (renderSettings.uvGenerationSettings != null) ? renderSettings.uvGenerationSettings.packMarginPixels : LightmapUVSettings.kDefaultPaddingTexels;
+            renderSettings.lightmapMaxSize       = ChiselLightmapUVManager.LightmapMaxSize(this, ChiselLightmapUVManager.LightmapAtlasSize());
 #endif
             ModelSettingsStore.Set(UnityEngine.EntityId.ToULong(GetEntityId()), new ModelSettings
             {
@@ -421,7 +424,8 @@ namespace Chisel.Components
                 NormalSmoothing = renderSettings.normalSmoothing,
                 NormalSmoothingAngle = renderSettings.normalSmoothingAngle,
                 LightmapTexelsPerUnit = renderSettings.lightmapTexelsPerUnit,
-                LightmapPaddingTexels = renderSettings.lightmapPaddingTexels
+                LightmapPaddingTexels = renderSettings.lightmapPaddingTexels,
+                LightmapMaxSize       = renderSettings.lightmapMaxSize
             });
             SetDirty();
             MarkAllBrushesDirty();

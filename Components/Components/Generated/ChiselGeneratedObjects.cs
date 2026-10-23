@@ -825,6 +825,8 @@ namespace Chisel.Components
 			ChiselUnityVisibilityManager.UpdateVisibility();
             
             var showRenderables = (drawModeFlags & DrawModeFlags.HideRenderables) == DrawModeFlags.None;
+            // the occlusion culling visualizer shows what occlusion culling sees: every mesh whole, hidden brushes too
+            var showWhole = UnityEditor.StaticOcclusionCullingVisualization.showOcclusionCulling;
 
             if (debugVisualizationRenderables != null)
             {
@@ -853,7 +855,7 @@ namespace Chisel.Components
                     // visualizer); otherwise it is drawn by OnRenderModel, through its copy without the hidden brushes
                     if (renderable.meshRenderer == null)
                         continue;
-                    var drawsItself = showRenderables && renderable.AllBrushesShown;
+                    var drawsItself = showRenderables && (renderable.AllBrushesShown || showWhole);
                     if (renderable.meshRenderer.forceRenderingOff == drawsItself)
                         renderable.meshRenderer.forceRenderingOff = !drawsItself;
                     if (drawsItself)

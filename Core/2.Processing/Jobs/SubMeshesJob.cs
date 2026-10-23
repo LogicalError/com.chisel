@@ -263,7 +263,7 @@ namespace Chisel.Core
                 if (render)
                     sectionLightmapHashes[i] = LightmapHash(section, ref buffer);
                 if (!keeping ||
-                    !(collider || GatherSurfacesJob.OneMeshPerMaterial(section.meshQuery)) ||
+                    !(collider || GatherSurfacesJob.OneMeshPerMaterial(section.meshQuery) || PrepareSubSections.OneMaterial(section.meshQuery)) ||
                     (render && section.endIndex - section.startIndex != 1))
                     return;
                 // a collider's section is the one description it starts at
@@ -668,6 +668,31 @@ namespace Chisel.Core
 
         public static bool Chunked(MeshQuery query) => query.LayerParameterIndex == SurfaceParameterIndex.PhysicsMaterial;
 
+        // A render query's meshes are chunked by surface: each surface is in the 32 m cell its centre lies in
+        // (Documentation~/Design/Chunking.md)
+        public const float kSurfaceChunkSize = 32.0f;
+
+        public static bool SurfaceChunked(MeshQuery query) => query.LayerParameterIndex == SurfaceParameterIndex.RenderMaterial;
+
+        // A query drawn with one material of its own (shadow-only): its surfaces' materials don't split its meshes
+        public static bool OneMaterial(MeshQuery query) => SurfaceChunked(query) && !GatherSurfacesJob.OneMeshPerMaterial(query);
+
+        public static uint CellOf(MinMaxAABB aabb)
+        {
+            var cell = (int3)math.floor((aabb.Min + aabb.Max) * (0.5f / kSurfaceChunkSize));
+            return math.hash(cell);
+        }
+
+        // The key a surface of a query is grouped by: its parameter, and its chunk
+        public static SurfaceGroupKey KeyOf(ref ChiselBrushRenderBuffer buffer, ChiselQuerySurface surface, uint brushChunk, bool chunked, bool surfaceChunked, bool oneMaterial)
+        {
+            return new SurfaceGroupKey
+            {
+                parameter = oneMaterial ? 0 : surface.surfaceParameter,
+                chunk     = chunked ? brushChunk : surfaceChunked ? CellOf(buffer.surfaces[surface.surfaceIndex].aabb) : 0
+            };
+        }
+
         const float kChunkSize = 16.0f;
 
         // The cell of space a brush's output is centred in: a collider is a mesh per physics material and chunk, so a
@@ -717,12 +742,16 @@ namespace Chisel.Core
             PrepareSubSections.Range(range, brushRenderData.Length, out var first, out var end);
             var anyChunked = false;
             var chunked = stackalloc bool[queryCount];
+            var surfaceChunked = stackalloc bool[queryCount];
+            var oneMaterial    = stackalloc bool[queryCount];
             var ids     = stackalloc UnsafeHashMap<SurfaceGroupKey, int>[queryCount];
             var lastKey = stackalloc SurfaceGroupKey[queryCount];
             var lastId  = stackalloc int[queryCount];
             for (int t = 0; t < queryCount; t++)
             {
                 chunked[t] = PrepareSubSections.Chunked(meshQueries[t]);
+                surfaceChunked[t] = PrepareSubSections.SurfaceChunked(meshQueries[t]);
+                oneMaterial[t]    = PrepareSubSections.OneMaterial(meshQueries[t]);
                 anyChunked |= chunked[t];
                 ids[t] = new UnsafeHashMap<SurfaceGroupKey, int>(16, Allocator.Temp);
                 lastId[t] = -1;
@@ -747,10 +776,9 @@ namespace Chisel.Core
                     if (surfaces.Length == 0)
                         continue;
                     ref var query = ref groups[t];
-                    var queryChunk = chunked[t] ? chunk : 0;
                     for (int s = 0; s < surfaces.Length; s++)
                     {
-                        var key = new SurfaceGroupKey { parameter = surfaces[s].surfaceParameter, chunk = queryChunk };
+                        var key = PrepareSubSections.KeyOf(ref buffer, surfaces[s], chunk, chunked[t], surfaceChunked[t], oneMaterial[t]);
                         if (lastId[t] < 0 || !key.Equals(lastKey[t]))
                         {
                             if (!ids[t].TryGetValue(key, out lastId[t]))
@@ -872,10 +900,14 @@ namespace Chisel.Core
             PrepareSubSections.Range(range, brushRenderData.Length, out var first, out var end);
             var groups = (PrepareSubSections.RangeGroups*)ranges.GetUnsafePtr() + range * queryCount;
             var chunked = stackalloc bool[queryCount];
+            var surfaceChunked = stackalloc bool[queryCount];
+            var oneMaterial    = stackalloc bool[queryCount];
             var next    = stackalloc int[queryCount];
             for (int t = 0; t < queryCount; t++)
             {
                 chunked[t] = PrepareSubSections.Chunked(meshQueries[t]);
+                surfaceChunked[t] = PrepareSubSections.SurfaceChunked(meshQueries[t]);
+                oneMaterial[t]    = PrepareSubSections.OneMaterial(meshQueries[t]);
                 next[t] = 0;
             }
             var chunks = rangeChunks[range];
@@ -890,17 +922,17 @@ namespace Chisel.Core
                         continue;
                     ref var query = ref groups[t];
                     var brushNodeID = querySurfaces[t].brushNodeID;
-                    var chunk = chunked[t] ? chunks[b - first] : 0;
                     var list = subMeshSurfaces[t];
                     for (int s = 0; s < surfaces.Length; s++)
                     {
+                        var key   = PrepareSubSections.KeyOf(ref brushRenderBuffer.Value, surfaces[s], chunks[b - first], chunked[t], surfaceChunked[t], oneMaterial[t]);
                         var index = query.counts[query.groupOf[next[t]++]]++;
                         list[index] = new SubMeshSurface
                         {
                             brushNodeID       = brushNodeID,
                             surfaceIndex      = surfaces[s].surfaceIndex,
-                            surfaceParameter  = surfaces[s].surfaceParameter,
-                            chunk             = chunk,
+                            surfaceParameter  = key.parameter,
+                            chunk             = key.chunk,
                             vertexCount       = surfaces[s].vertexCount,
                             indexCount        = surfaces[s].indexCount,
                             surfaceHashValue  = surfaces[s].surfaceHashValue,
@@ -1029,6 +1061,7 @@ namespace Chisel.Core
                 subMeshDescriptions[0].meshQuery.LayerParameterIndex == SurfaceParameterIndex.RenderMaterial)
             {
                 var prevQuery = subMeshDescriptions[0].meshQuery;
+                var prevChunk = subMeshDescriptions[0].chunk;
                 var startIndex = 0;
                 for (; descriptionIndex < subMeshDescriptions.Length; descriptionIndex++)
                 {
@@ -1038,10 +1071,11 @@ namespace Chisel.Core
                         subMeshCount.meshQuery.LayerParameterIndex != SurfaceParameterIndex.RenderMaterial)
                         break;
 
-                    // a render query's materials each get a mesh of their own, so a mesh changes only with its material
+                    // a render query's materials each get a mesh of their own, so a mesh changes only with its material, and
+                    // so does each chunk
                     var currQuery = subMeshCount.meshQuery;
                     if (descriptionIndex == startIndex ||
-                        (prevQuery == currQuery && !OneMeshPerMaterial(currQuery)))
+                        (prevQuery == currQuery && !OneMeshPerMaterial(currQuery) && prevChunk == subMeshCount.chunk))
                     {
                         continue;
                     }
@@ -1066,6 +1100,7 @@ namespace Chisel.Core
 
                     startIndex = descriptionIndex;
                     prevQuery = currQuery;
+                    prevChunk = subMeshCount.chunk;
                 }
 
                 {

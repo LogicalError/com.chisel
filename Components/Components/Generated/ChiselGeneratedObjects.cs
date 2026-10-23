@@ -427,7 +427,7 @@ namespace Chisel.Components
         // missing (its objects were deleted) the model is built again, its meshes all made anew.
         void FindRenderables(ChiselModelComponent model, GameObjectState gameObjectState, ref ChiselMeshUpdates meshUpdates)
         {
-            var existing = DictionaryPool<(SurfaceDestinationFlags, ulong), ChiselRenderObjects>.Get();
+            var existing = DictionaryPool<(SurfaceDestinationFlags, ulong, uint), ChiselRenderObjects>.Get();
             try
             {
                 if (renderables != null)
@@ -439,7 +439,7 @@ namespace Chisel.Components
                             renderable?.Destroy();
                             continue;
                         }
-                        if (!existing.TryAdd((renderable.query, renderable.surfaceParameter), renderable))
+                        if (!existing.TryAdd((renderable.query, renderable.surfaceParameter, renderable.chunk), renderable))
                             renderable.Destroy();
                     }
                 }
@@ -451,7 +451,7 @@ namespace Chisel.Components
                 {
                     var kept  = meshUpdates.meshUpdatesKept[k];
                     var query = RendererQuery((int)kept.objectIndex);
-                    if (!existing.Remove((query, kept.surfaceParameter), out var renderable) || !renderable.HasGeometry)
+                    if (!existing.Remove((query, kept.surfaceParameter, kept.chunk), out var renderable) || !renderable.HasGeometry)
                     {
                         missing = true;
                         renderable?.Destroy();
@@ -463,10 +463,11 @@ namespace Chisel.Components
                 {
                     var update = meshUpdates.meshUpdatesRenderables[i];
                     var query  = RendererQuery((int)update.objectIndex);
-                    if (!existing.Remove((query, update.surfaceParameter), out var renderable))
+                    if (!existing.Remove((query, update.surfaceParameter, update.chunk), out var renderable))
                     {
                         renderable = ChiselRenderObjects.Create(RendererName((int)update.objectIndex, update.surfaceParameter), containerTransform, gameObjectState, query);
                         renderable.surfaceParameter = update.surfaceParameter;
+                        renderable.chunk = update.chunk;
                     }
                     found[i] = renderable;
                     update.objectIndex = (ulong)i;
@@ -486,7 +487,7 @@ namespace Chisel.Components
             }
             finally
             {
-                DictionaryPool<(SurfaceDestinationFlags, ulong), ChiselRenderObjects>.Release(existing);
+                DictionaryPool<(SurfaceDestinationFlags, ulong, uint), ChiselRenderObjects>.Release(existing);
             }
         }
 

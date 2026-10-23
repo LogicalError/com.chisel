@@ -27,7 +27,7 @@ namespace Chisel.Core
         public ulong objectIndex;
         // a render mesh's material (each material is a mesh of its own)
         public ulong surfaceParameter;
-        // a collider's chunk of space
+        // the chunk of space of a collider or a render mesh
         public uint  chunk;
         // what a render mesh's lightmap layout is made from: its baked lightmap stays valid while this does
         public uint  lightmapHashValue;
@@ -157,6 +157,7 @@ namespace Chisel.Core
                                 meshIndex        = -1,
                                 objectIndex      = (ulong)renderIndex,
                                 surfaceParameter = meshDescriptions[subMeshSection.startIndex].surfaceParameter,
+                                chunk            = meshDescriptions[subMeshSection.startIndex].chunk,
                                 type             = ChiselMeshType.Render,
                                 subMeshSection   = subMeshSection
                             });
@@ -168,6 +169,7 @@ namespace Chisel.Core
                             meshIndex        = meshIndex,
                             objectIndex      = (ulong)renderIndex,
                             surfaceParameter = GatherSurfacesJob.OneMeshPerMaterial(subMeshSection.meshQuery) ? meshDescriptions[subMeshSection.startIndex].surfaceParameter : 0,
+                            chunk            = meshDescriptions[subMeshSection.startIndex].chunk,
                             lightmapHashValue = sectionLightmapHashes.IsCreated && i < sectionLightmapHashes.Length ? sectionLightmapHashes[i] : 0,
                             type             = ChiselMeshType.Render,
 						    subMeshSection   = subMeshSection

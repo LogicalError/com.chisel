@@ -49,6 +49,8 @@ namespace Chisel.Components
         public SurfaceDestinationFlags  query;
         // the material it draws (0: the shadow-only renderers, which draw all of theirs with one)
         public ulong            surfaceParameter;
+        // the chunk of space it draws (Documentation~/Design/Chunking.md)
+        public uint             chunk;
         public GameObject       container;
         public Mesh             sharedMesh;
         public bool             enabled = true;

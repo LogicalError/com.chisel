@@ -142,8 +142,8 @@ namespace Chisel.Core
         public ulong renderMaterial;
 
         /// <summary>The destination flags of the decal's material. Only Renderable and ShadowReceiving are used: a
-        /// decal is drawn only where both the surface and this allow it. Casting shadows and colliding follow the
-        /// surface below.</summary>
+        /// decal is drawn only where both the surface and this allow it. Casting shadows follows the surface
+        /// below; a decal never collides (the collider keeps the uncut surface).</summary>
         public SurfaceDestinationFlags destinationFlags;
 
         /// <summary>

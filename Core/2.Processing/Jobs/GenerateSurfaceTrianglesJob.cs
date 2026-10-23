@@ -572,7 +572,7 @@ namespace Chisel.Core
 					using var builder = new BlobBuilder(Allocator.Temp, 4096);
 
 					ref var root = ref builder.ConstructRoot<ChiselBrushRenderBuffer>();
-					var surfaceBuffers = builder.Allocate(ref root.surfaces, baseSurfaceCount + decalCandidates.Length);
+					var surfaceBuffers = builder.Allocate(ref root.surfaces, SlotCount(baseSurfaceCount, decalCandidates.Length));
 
 					var triangulator = new UnsafeTriangulator<double2>();
 					for (int surf = 0; surf < surfaceLoopIndices.Length; surf++)
@@ -982,7 +982,20 @@ namespace Chisel.Core
 				MeshAlgorithms.ComputeLightmapCoordinates(remaining.renderVertices, finalFaceNormal);
 				buf.Construct(builder, remaining.indices, remaining.colliderVertices,
 							  remaining.selectVertices, remaining.renderVertices,
-							  surf, surf, flags, parms, outputFlags);
+							  surf, surf, flags & ~SurfaceDestinationFlags.Collidable, parms, outputFlags);
+
+				// and the collider keeps the whole surface, which the weld moves as it moves a decal's pieces
+				if ((flags & SurfaceDestinationFlags.Collidable) != 0)
+				{
+					var copySlot = ColliderCopySlot(baseSurfaceCount, decalCandidateStart[baseSurfaceCount], surf);
+					ref var copy = ref surfaceBuffers[copySlot];
+					copy.Construct(builder, surfaceIndexList,
+								   uniqueVertexMapper.surfaceColliderVertices,
+								   uniqueVertexMapper.surfaceSelectVertices,
+								   uniqueVertexMapper.surfaceRenderVertices,
+								   copySlot, surf, SurfaceDestinationFlags.Collidable, parms, outputFlags);
+					copy.decalEntityID = CuttingDecal(decalCandidates, candidateStart, candidateCount);
+				}
 			} else
 			buf.Construct(builder, surfaceIndexList,
 						uniqueVertexMapper.surfaceColliderVertices,
@@ -992,6 +1005,30 @@ namespace Chisel.Core
 			buf.sectionInput = sectionInput;
 			buf.hotspot       = hotspotInfo;
 			buf.hotspotSource = hotspotSource;
+		}
+
+		// A brush's slots: its surfaces, a slot per decal candidate, and when it has candidates, a slot per surface for
+		// the uncut collider copy of a surface an opaque decal cut
+		static int SlotCount(int baseSurfaceCount, int candidateCount)
+		{
+			return baseSurfaceCount + candidateCount + (candidateCount > 0 ? baseSurfaceCount : 0);
+		}
+
+		static int ColliderCopySlot(int baseSurfaceCount, int candidateCount, int surf)
+		{
+			return baseSurfaceCount + candidateCount + surf;
+		}
+
+		// The topmost opaque decal on the surface: the collider copy is marked as the decal's, like its pieces
+		ulong CuttingDecal(NativeList<int> decalCandidates, int candidateStart, int candidateCount)
+		{
+			for (int k = candidateCount - 1; k > 0; k--)
+			{
+				var volume = decalVolumes[decalCandidates[candidateStart + k]];
+				if (!volume.IsTransparent)
+					return volume.entityID;
+			}
+			return decalVolumes[decalCandidates[candidateStart]].entityID;
 		}
 
 		// After every surface: the empty decal slots, the mesh queries, and the brush's render buffer in the cache.
@@ -1010,6 +1047,16 @@ namespace Chisel.Core
 					emptySlot.baseSurfaceIndex = s;
 				}
 			}
+			var candidateCount = decalCandidateStart[baseSurfaceCount];
+			var firstCopySlot  = candidateCount > 0 ? ColliderCopySlot(baseSurfaceCount, candidateCount, 0) : surfaceBuffers.Length;
+			for (int s = firstCopySlot; s < surfaceBuffers.Length; s++)
+			{
+				ref var emptySlot = ref surfaceBuffers[s];
+				if (emptySlot.vertexCount != 0)
+					continue;
+				emptySlot.surfaceIndex     = s;
+				emptySlot.baseSurfaceIndex = s - firstCopySlot;
+			}
 
 			using var queryList = new NativeList<ChiselQuerySurface>(surfaceBuffers.Length, Allocator.Temp);
 			var queryArr = builder.Allocate(ref root.querySurfaces, meshQueries.Length);
@@ -1018,6 +1065,8 @@ namespace Chisel.Core
 				var meshQuery = meshQueries[t];
 				var layerQueryMask = meshQuery.LayerQueryMask;
 				var layerQuery = meshQuery.LayerQuery;
+				// a collider copy only goes to colliders, never to the hidden surfaces
+				var colliderQuery = (layerQuery & SurfaceDestinationFlags.Collidable) != 0;
 				var surfaceParameterIndex = (meshQuery.LayerParameterIndex >= SurfaceParameterIndex.Parameter1 &&
 												meshQuery.LayerParameterIndex <= SurfaceParameterIndex.MaxParameterIndex) ?
 												(int)meshQuery.LayerParameterIndex - 1 : -1;
@@ -1032,6 +1081,8 @@ namespace Chisel.Core
 						continue;
 					var destinationFlags = buffer.destinationFlags;
 					if ((destinationFlags & layerQueryMask) != layerQuery)
+						continue;
+					if (s >= firstCopySlot && !colliderQuery)
 						continue;
 
 					queryList.AddNoResize(new ChiselQuerySurface
@@ -1166,7 +1217,7 @@ namespace Chisel.Core
 
 				using var builder = new BlobBuilder(Allocator.Temp, 4096);
 				ref var root = ref builder.ConstructRoot<ChiselBrushRenderBuffer>();
-				var surfaceBuffers = builder.Allocate(ref root.surfaces, baseSurfaceCount + decalCandidates.Length);
+				var surfaceBuffers = builder.Allocate(ref root.surfaces, SlotCount(baseSurfaceCount, decalCandidates.Length));
 
 				for (int surf = 0; surf < baseSurfaceCount; surf++)
 				{

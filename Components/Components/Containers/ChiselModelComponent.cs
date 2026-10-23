@@ -346,12 +346,23 @@ namespace Chisel.Components
 
             // TODO: move out of here
 #if !UNITY_EDITOR
-            if (generated != null && generated.meshRenderers != null)
+            // A player has no editor drawing: the renderers draw themselves, debug visualizations never
+            if (generated != null && generated.renderables != null)
             {
-                foreach(var renderable in generated.renderables)
-                {                    
-                    renderable.meshRenderer.forceRenderingOff = true;
-                    renderable.meshRenderer.enabled = renderable.sharedMesh.vertexCount == 0;
+                foreach (var renderable in generated.renderables)
+                {
+                    if (renderable == null || !renderable.meshRenderer)
+                        continue;
+                    renderable.meshRenderer.forceRenderingOff = false;
+                    renderable.meshRenderer.enabled = renderable.sharedMesh && renderable.sharedMesh.vertexCount > 0;
+                }
+            }
+            if (generated != null && generated.debugVisualizationRenderables != null)
+            {
+                foreach (var renderable in generated.debugVisualizationRenderables)
+                {
+                    if (renderable != null && renderable.meshRenderer)
+                        renderable.meshRenderer.enabled = false;
                 }
             }
 #endif
